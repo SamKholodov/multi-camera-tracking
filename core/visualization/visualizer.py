@@ -102,7 +102,7 @@ class Visualizer:
         return frame
 
     @staticmethod
-    def create_video_writer(path, frame, fps=30):
+    def create_video_writer(path, frame, fps=10):
         """Open VideoWriter with even width/height (better compatibility on Windows)."""
         h, w = frame.shape[:2]
         w, h = w - (w % 2), h - (h % 2)
@@ -123,6 +123,7 @@ class Visualizer:
         save_output=False,
         output_path="output.mp4",
         writer=None,
+        fps=10,
     ):
         if frames:
             if len(frames) == 1:
@@ -146,7 +147,7 @@ class Visualizer:
                     writer = cv2.VideoWriter(
                         output_path,
                         cv2.VideoWriter_fourcc(*"mp4v"),
-                        30,
+                        fps,
                         (w, h),
                     )
                 writer.write(final_display)

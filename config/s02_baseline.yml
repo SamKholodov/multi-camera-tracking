@@ -48,6 +48,7 @@ multi_camera:
   results_dir: outputs/s02_baseline
 
 output:
+  video_fps: 10
   visualize: false
   save_video: true
   # One MP4 per camera with global ids: outputs/s02_baseline/videos/c006.mp4 ...

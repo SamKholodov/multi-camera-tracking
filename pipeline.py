@@ -202,7 +202,10 @@ class SingleCameraTrackerPipeline:
         return tracks
 
     def run(self, visualize=True, save=False, save_tracks=True, output_path="output.mp4"):
+        from core.io.camera_manager import read_source_fps
+
         cap = cv2.VideoCapture(self.source)
+        fps = read_source_fps(cap, default=10.0)
         writer = None
         try:
             while True:
@@ -223,7 +226,8 @@ class SingleCameraTrackerPipeline:
                     visualize=visualize,
                     save_output=save,
                     output_path=output_path,
-                    writer=writer
+                    writer=writer,
+                    fps=fps,
                 )
 
                 if visualize and cv2.waitKey(1) & 0xFF == ord('q'):
@@ -287,9 +291,13 @@ class MultiCameraTrackingPipeline:
         results_dir=None,
         roi_paths=None,
         detection_files=None,
+        video_fps=10.0,
     ):
         self.sources = list(sources)
-        self.camera_manager = CameraManager(sources=self.sources)
+        self.video_fps = float(video_fps)
+        self.camera_manager = CameraManager(
+            sources=self.sources, default_fps=self.video_fps
+        )
         # ``homos`` are **H_image_to_world** per camera.
         if homos is None:
             self.homos = [np.eye(3, dtype=np.float64) for _ in self.sources]
@@ -663,7 +671,11 @@ class MultiCameraTrackingPipeline:
                         if cam_idx not in per_cam_writers:
                             out_mp4 = video_dir / f"c{cam_label:03d}.mp4"
                             per_cam_writers[cam_idx] = (
-                                self.visualizer.create_video_writer(out_mp4, vis)
+                                self.visualizer.create_video_writer(
+                                    out_mp4,
+                                    vis,
+                                    fps=self.camera_manager.fps_list[cam_idx],
+                                )
                             )
                         per_cam_writers[cam_idx].write(vis)
                     elif save:
@@ -679,6 +691,7 @@ class MultiCameraTrackingPipeline:
                         save_output=True,
                         output_path=output_path,
                         writer=writer,
+                        fps=self.video_fps,
                     )
 
                 self.frame_idx += 1

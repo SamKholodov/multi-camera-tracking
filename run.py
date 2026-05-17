@@ -215,6 +215,7 @@ def run_from_config(config):
             results_dir=multi_cfg.get("results_dir"),
             roi_paths=_maybe_roi_paths(sources, multi_cfg.get("roi")),
             detection_files=detection_files,
+            video_fps=float(output_cfg.get("video_fps", 10)),
         )
         pipeline.run(
             visualize=visualize,
