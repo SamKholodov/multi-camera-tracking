@@ -1,0 +1,3 @@
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"

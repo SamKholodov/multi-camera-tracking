@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# ML weights (download via Ultralytics or place locally)
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Experiment outputs (regenerate with run.py)
+outputs/
+
+# CityFlow / AICity dataset (large; obtain separately)
+datasets/train/
+datasets/validation/
+datasets/test/
+datasets/cam_loc/
+datasets/cam_timestamp/
+datasets/cam_framenum/
+
+# Generated from calibration.txt (run.py creates on first load)
+**/calibration_i2w.txt
+datasets/validation/S02/gt_for_eval.txt
+
+# Videos and heavy artifacts
+*.avi
+*.mp4
+*.mkv
+*.tgz
+*.tar.gz
+*.zip
+
+# Local runs / debug
+tracks_history.json
+*.log
+wandb/
+runs/
+
+# Papers / misc (optional local files)
+*.pdf
+
+# Pyright / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage

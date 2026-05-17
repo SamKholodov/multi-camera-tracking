@@ -1,0 +1,34 @@
+# Single-camera DeepOCSORT on a file (no ReID embeddings by default).
+# Set single_camera.source to your MP4 path, then:
+#   python run.py --config config/deepocsort_video.yml
+
+run_mode: single_camera
+
+detector:
+  model: yolov8m.pt
+  # Список классов COCO: каждый номер отдельной строкой или одна строка [2, 3, 5, 7].
+  # Неверно: "- 2, 3, 5, 7" — YAML даст одну строку, YOLO упадёт в NMS.
+  target_classes: [2, 3, 5, 7]
+  conf_thres: 0.3
+  device: null
+
+tracker:
+  type: deepocsort
+  use_embeddings: false
+  det_thresh: 0.3
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+
+single_camera:
+  # Windows: use single quotes or forward slashes — in double quotes \U is a YAML escape.
+  source: 'C:/Users/youthin/python_projects/ultra nkb/edge_architecture/data/test8.mp4'
+  cam_id: 0
+  homo: null
+  max_history_gap_frames: 30
+
+output:
+  visualize: true
+  save_video: true
+  output_path: outputs/deepocsort_video.mp4
+  save_tracks_json: true
