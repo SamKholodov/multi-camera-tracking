@@ -66,6 +66,9 @@ tracks_history.json
 wandb/
 runs/
 
+# Legacy entry point (use run.py)
+main.py
+
 # Papers / misc (optional local files)
 *.pdf
 

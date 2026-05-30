@@ -24,7 +24,9 @@ from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 
-from .calibration import project_point
+from core.mot.types import WORLD_COORD_MISSING, homography_valid, world_point_from_row
+
+from .calibration import project_bbox_bottom_center
 
 
 class MCMTResultWriter:
@@ -81,7 +83,7 @@ class MCMTResultWriter:
 
         cam_id = self.cam_ids[cam_index]
         H_i2w = self.homographies_i2w[cam_index]
-        # MOT: один global id на кадр — одна строка; при конфликте берём max conf.
+        # MOT: one global id per frame -> one row; on conflict keep the max conf.
         best_global: dict[int, tuple] = {}
 
         for row in tracks:
@@ -92,10 +94,13 @@ class MCMTResultWriter:
             w = max(0.0, x2 - x1)
             h = max(0.0, y2 - y1)
 
-            # Bottom-center as ground-contact point.
-            bcx = (x1 + x2) / 2.0
-            bcy = y2
-            xw, yw = project_point(H_i2w, bcx, bcy)
+            wpt = world_point_from_row(row)
+            if wpt is not None:
+                xw, yw = wpt
+            elif homography_valid(H_i2w):
+                xw, yw = project_bbox_bottom_center(H_i2w, x1, y1, x2, y2)
+            else:
+                xw, yw = WORLD_COORD_MISSING, WORLD_COORD_MISSING
 
             self._per_cam_local[cam_id].append(
                 (frame_id, local_tid, x1, y1, w, h, conf)

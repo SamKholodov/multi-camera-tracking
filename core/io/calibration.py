@@ -106,6 +106,21 @@ def project_point(
     return xw, yw
 
 
+def project_bbox_bottom_center(
+    H_image_to_world: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    *,
+    flip_y: bool = False,
+) -> tuple[float, float]:
+    """Project the bottom-center of an image bbox to world coordinates."""
+    bcx = (float(x1) + float(x2)) / 2.0
+    bcy = float(y2)
+    return project_point(H_image_to_world, bcx, bcy, flip_y=flip_y)
+
+
 def project_world_to_image(
     H_world_to_image: np.ndarray,
     xw: float,

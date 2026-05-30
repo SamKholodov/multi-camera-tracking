@@ -1,31 +1,44 @@
 import numpy as np
 import cv2
-import json
+import time
 from pathlib import Path
 import yaml
 
 from scipy.optimize import linear_sum_assignment
 
 from core.detector.detector import Detector
-from core.geometry.homography_transformer import HomographyTransformer
+from core.io.calibration import project_bbox_bottom_center
 from core.io.camera_manager import CameraManager
+from core.mot.types import (
+    TRACK_NCOLS,
+    enrich_tracks_world,
+    homography_valid,
+    world_point_from_row,
+)
+from core.io.track_history import save_tracks_history_json
 from core.io.mcmt_writer import MCMTResultWriter
 from core.io.mot_detections import MotDetectionStore
 from core.io.roi import ROIFilter
 from core.mot.tracker.bot_sort_tracker import BotSortTracker
 from core.mot.tracker.deepocsort_tracker import DeepOcSortTracker
+from core.mot.tracker.sort_tracker import SortTracker
+from core.utils.fps import FpsCollector, sct_timing_ms
 from core.utils.utilities import Utils
 from core.visualization.visualizer import Visualizer
 
-
 def _create_tracker(tracker_config):
-    """Build BotSort or DeepOcSort tracker from YAML ``tracker`` dict."""
+    """Build Sort, BotSort, or DeepOcSort tracker from YAML ``tracker`` dict."""
     cfg = dict(tracker_config or {})
     tracker_type = str(cfg.pop("type", "botsort")).lower().strip()
+    reid_keys = ("reid_weights", "device", "half", "use_default_reid", "use_embeddings", "custom_reid_extractor")
     if tracker_type in ("deepocsort", "deep_ocsort"):
-        for k in ("reid_weights", "device", "half", "use_default_reid"):
+        for k in reid_keys:
             cfg.pop(k, None)
         return DeepOcSortTracker(**cfg)
+    if tracker_type == "sort":
+        for k in reid_keys:
+            cfg.pop(k, None)
+        return SortTracker(**cfg)
     return BotSortTracker(**cfg)
 
 
@@ -67,11 +80,11 @@ class SingleCameraTrackerPipeline:
         self.cam_id = cam_id
         # ``homo`` is **H_image_to_world** (see ``core.io.calibration``).
         self.homo = np.asarray(homo, dtype=np.float64)
-        self.homography_transformer = HomographyTransformer()
         # After this many frames without a detection for a track, stop appending
         # placeholder rows (has_detection=0). None = keep appending until video end.
         self.max_history_gap_frames = max_history_gap_frames
         self.roi_filter = ROIFilter.from_spec(roi_path) if roi_path is not None else None
+        self.last_frame_ms = None
 
     def _filter_detections_roi(self, dets: np.ndarray) -> np.ndarray:
         if self.roi_filter is None or dets is None or len(dets) == 0:
@@ -86,7 +99,7 @@ class SingleCameraTrackerPipeline:
     def _update_tracks_storage(self, tracks):
         updated_ids = set()
         for t in tracks:
-            x1, y1, x2, y2, tid, conf, det_idx, has_detection = t
+            x1, y1, x2, y2, tid, conf, det_idx, has_detection = t[:8]
             tid = int(tid)
             updated_ids.add(tid)
 
@@ -96,9 +109,8 @@ class SingleCameraTrackerPipeline:
             bcx = cx
             bcy = float(y2)
 
-            projected_bc = self.homography_transformer.apply_homo_to_point(
-                [bcx, bcy], self.homo
-            )
+            wpt = world_point_from_row(t)
+            projected_bc = [wpt[0], wpt[1]] if wpt is not None else None
 
             if tid not in self.tracks:
                 self.tracks[tid] = {
@@ -170,13 +182,15 @@ class SingleCameraTrackerPipeline:
 
     def process_frame(self, frame, update_storage=True):
         """
-        Один кадр: детекция → SCT → (опционально) локальная история в self.tracks.
-        Для мультикамеры вызывайте из общего цикла с синхронными кадрами.
-        При frame is None возвращает пустой массив, индекс кадра не увеличивает.
+        One frame: detection → SCT → (optionally) local history in self.tracks.
+        For multicamera, call from a global loop with synchronized frames.
+        If frame is None, return empty array, do not increment frame index.
         """
         if frame is None:
-            return np.empty((0, 8), dtype=np.float32)
+            self.last_frame_ms = None
+            return np.empty((0, TRACK_NCOLS), dtype=np.float32)
 
+        t0 = time.perf_counter()
         if self.detection_store is not None:
             # MOT files use 1-based frame ids; first processed frame has frame_idx 0.
             detections_array = self.detection_store.get(self.frame_idx + 1)
@@ -188,10 +202,15 @@ class SingleCameraTrackerPipeline:
                 if detections is not None and len(detections) > 0
                 else np.empty((0, 6), dtype=np.float32)
             )
+        t1 = time.perf_counter()
         detections_array = self._filter_detections_roi(detections_array)
 
         tracks = self.tracker.update(detections_array, frame)
         tracks = self._filter_tracks_roi(tracks)
+        tracks = enrich_tracks_world(tracks, self.homo)
+        t2 = time.perf_counter()
+
+        self.last_frame_ms = sct_timing_ms(t0, t1, t2)
 
         if update_storage:
             updated_ids = self._update_tracks_storage(tracks)
@@ -241,37 +260,14 @@ class SingleCameraTrackerPipeline:
             cv2.destroyAllWindows()
         
         if save_tracks:
-            self._save_tracks_to_json()
-
-    def _save_tracks_to_json(self, output_path="tracks_history.json", indent=2):
-        """
-        Save accumulated track history to a JSON file.
-        """
-        def _to_jsonable(value):
-            if isinstance(value, np.ndarray):
-                return value.tolist()
-            if isinstance(value, np.generic):
-                return value.item()
-            if isinstance(value, dict):
-                return {str(k): _to_jsonable(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [_to_jsonable(v) for v in value]
-            return value
-
-        serializable_tracks = {
-            str(int(track_id)): _to_jsonable(track_data)
-            for track_id, track_data in self.tracks.items()
-        }
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(serializable_tracks, f, ensure_ascii=False, indent=indent)
+            save_tracks_history_json(self.tracks)
 
 class MultiCameraTrackingPipeline:
     """
-    Оркестрация мультикамерного трекинга:
-    - чтение кадров из sources (CameraManager)
-    - на каждой камере: детекция + SCT (BotSort или DeepOCSORT по tracker.type)
-    - межкамерная ассоциация: матрица стоимостей + венгерский алгоритм
+    Orchestration of multicamera tracking:
+    - reading frames from sources (CameraManager)
+    - on each camera: detection + SCT (Sort, BotSort or DeepOcSort by tracker.type)
+    - cross-camera association: cost matrix + Hungarian algorithm
     """
 
     def __init__(
@@ -284,6 +280,8 @@ class MultiCameraTrackingPipeline:
         detector_device=None,
         homos=None,
         association_cost_threshold=0.35,
+        association_reid_weight=0.5,
+        geometry_max_distance=25.0,
         max_cross_cam_gap_frames=300,
         max_history_gap_frames=30,
         mapping_clear_after_lost_frames=None,
@@ -341,6 +339,13 @@ class MultiCameraTrackingPipeline:
 
         self.frame_idx = 0
         self.association_cost_threshold = float(association_cost_threshold)
+        # Weight of the appearance (ReID) term in the total association cost:
+        #   cost = lambda * reid_cost + (1 - lambda) * geometry_cost.
+        # lambda=1.0 -> ReID only (legacy behavior), lambda=0.0 -> geometry only.
+        self.association_reid_weight = float(np.clip(association_reid_weight, 0.0, 1.0))
+        # Normalization scale of the geometry cost (in homography world units,
+        # usually meters): geometry_cost = min(dist / geometry_max_distance, 1).
+        self.geometry_max_distance = float(geometry_max_distance)
         self.max_cross_cam_gap_frames = int(max_cross_cam_gap_frames)
         self.mapping_clear_after_lost_frames = int(
             mapping_clear_after_lost_frames
@@ -348,12 +353,14 @@ class MultiCameraTrackingPipeline:
             else max_history_gap_frames
         )
 
-        # global_id -> {smooth_feat, last_cam, last_frame}
+        # global_id -> {smooth_feat, world, last_cam, last_frame}
+        # ``world`` — last projected world coordinates (xworld, yworld)
+        # of the bottom-center point of the bbox; used in geometry cost.
         self.global_tracks = {}
         self._next_global_id = 1
         # (cam_index, local_track_id) -> global_id
         self.local_to_global = {}
-        # сколько кадров подряд local_tid не было в выходе SCT на этом кадре
+        # number of consecutive frames a local_tid has been missing from SCT output
         self._local_absent_frames: dict[tuple[int, int], int] = {}
 
         self.results_dir = Path(results_dir) if results_dir else None
@@ -364,7 +371,7 @@ class MultiCameraTrackingPipeline:
         )
 
     def _step_sct(self, frames):
-        """На каждой камере — тот же путь, что в SingleCameraTrackerPipeline.process_frame."""
+        """Same path as in SingleCameraTrackerPipeline.process_frame for each camera."""
         per_cam_tracks = []
         for cam_id, frame in enumerate(frames):
             tracks = self.per_cam_pipelines[cam_id].process_frame(
@@ -374,15 +381,65 @@ class MultiCameraTrackingPipeline:
         return per_cam_tracks
 
     def _emb_dist(self, a, b):
-        """Косинусное расстояние для L2-нормированных векторов."""
+        """Cosine distance for L2-normalized vectors."""
         a = np.asarray(a, dtype=np.float64).reshape(-1)
         b = np.asarray(b, dtype=np.float64).reshape(-1)
         if a.size == 0 or b.size == 0:
             return 1e9
         return float(1.0 - np.clip(np.dot(a, b), -1.0, 1.0))
 
+    def _world_point(self, cam_id, row):
+        """World coords from enriched row (cols 8–9), else project if homography set."""
+        wpt = world_point_from_row(row)
+        if wpt is not None:
+            return wpt
+        H = self.homos[cam_id]
+        if homography_valid(H):
+            return project_bbox_bottom_center(H, row[0], row[1], row[2], row[3])
+        return None
+
+    def _geo_cost(self, a, b):
+        """Normalized distance in world coordinates, [0, 1]."""
+        if a is None or b is None:
+            return None
+        d = float(np.hypot(a[0] - b[0], a[1] - b[1]))
+        if self.geometry_max_distance <= 0:
+            return 0.0
+        return min(d / self.geometry_max_distance, 1.0)
+
+    def _assoc_cost(self, fvec, gfeat, wpt, gwpt):
+        """Combined cost: lambda * ReID + (1 - lambda) * geometry."""
+        reid = None
+        if fvec is not None and gfeat is not None:
+            reid = self._emb_dist(fvec, gfeat)
+        geo = self._geo_cost(wpt, gwpt)
+        lam = self.association_reid_weight
+        if reid is not None and geo is not None:
+            return lam * reid + (1.0 - lam) * geo
+        if reid is not None:
+            return reid
+        if geo is not None:
+            return geo
+        return None
+
+    def _update_global(self, gid, cam_id, fvec, wpt):
+        """EMA update of appearance + last world coordinate of global track."""
+        g = self.global_tracks[gid]
+        if fvec is not None:
+            f = np.asarray(fvec, dtype=np.float32)
+            if g.get("smooth_feat") is None:
+                g["smooth_feat"] = f.copy()
+            else:
+                alpha = 0.9
+                g["smooth_feat"] = alpha * g["smooth_feat"] + (1.0 - alpha) * f
+                g["smooth_feat"] /= np.linalg.norm(g["smooth_feat"]) + 1e-12
+        if wpt is not None:
+            g["world"] = (float(wpt[0]), float(wpt[1]))
+        g["last_cam"] = cam_id
+        g["last_frame"] = self.frame_idx
+
     def _candidate_globals(self, cam_id):
-        """Глобальные гипотезы с другой камеры и не слишком старые."""
+        """Global hypotheses from another camera and not too old."""
         out = []
         for gid, meta in self.global_tracks.items():
             if meta["last_cam"] == cam_id:
@@ -394,14 +451,10 @@ class MultiCameraTrackingPipeline:
 
     def _associate_cross_camera(self, per_cam_tracks):
         """
-        Несопоставленные (cam, local_tid) пытаемся привязать к существующим global_id
-        через linear_sum_assignment; иначе создаём новый global_id.
+        Unmatched (cam, local_tid) try to attach to existing global_id
+        through linear_sum_assignment; otherwise create a new global_id.
         """
         COST_INF = 1e9
-
-        # gid, уже занятые активным локальным треком на этой камере в этом кадре.
-        # Нужно, чтобы венгерка не назначила тот же gid второму local_tid на той же
-        # камере → иначе MCMT пишет один global_id с несколькими bbox в кадре.
         taken_per_cam: dict[int, set] = {}
 
         unmatched = []
@@ -411,61 +464,51 @@ class MultiCameraTrackingPipeline:
             for row in tracks:
                 local_tid = int(row[4])
                 key = (cam_id, local_tid)
+                wpt = self._world_point(cam_id, row)
                 if key in self.local_to_global:
                     gid = self.local_to_global[key]
                     taken = taken_per_cam.setdefault(cam_id, set())
                     if gid in taken:
-                        # Два активных local_tid на одной камере с одним global_id.
+                        # Two active local_tid on the same camera with the same global_id.
                         feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
-                        self._new_global(cam_id, local_tid, feats.get(local_tid))
+                        self._new_global(cam_id, local_tid, feats.get(local_tid), wpt)
                         gid = self.local_to_global[key]
                     taken.add(gid)
                     feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
                     fvec = feats.get(local_tid)
-                    g = self.global_tracks[gid]
-                    if fvec is not None:
-                        if g["smooth_feat"] is None:
-                            g["smooth_feat"] = np.asarray(fvec, dtype=np.float32).copy()
-                        else:
-                            alpha = 0.9
-                            g["smooth_feat"] = (
-                                alpha * g["smooth_feat"]
-                                + (1.0 - alpha) * np.asarray(fvec, dtype=np.float32)
-                            )
-                            g["smooth_feat"] /= (
-                                np.linalg.norm(g["smooth_feat"]) + 1e-12
-                            )
-                    g["last_cam"] = cam_id
-                    g["last_frame"] = self.frame_idx
+                    self._update_global(gid, cam_id, fvec, wpt)
                     continue
                 feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
                 fvec = feats.get(local_tid)
-                unmatched.append((cam_id, local_tid, fvec))
+                unmatched.append((cam_id, local_tid, fvec, wpt))
 
         if not unmatched:
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
             return
 
-        candidates = self._candidate_globals_for_unmatched({c for c, _, _ in unmatched})
+        candidates = self._candidate_globals_for_unmatched({c for c, _, _, _ in unmatched})
         if not candidates:
-            for cam_id, local_tid, _f in unmatched:
-                self._new_global(cam_id, local_tid, _f)
+            for cam_id, local_tid, _f, _w in unmatched:
+                self._new_global(cam_id, local_tid, _f, _w)
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
             return
 
         n_u = len(unmatched)
         n_g = len(candidates)
         C = np.full((n_u, n_g), COST_INF, dtype=np.float64)
-        for i, (cam_id, local_tid, fvec) in enumerate(unmatched):
+        for i, (cam_id, local_tid, fvec, wpt) in enumerate(unmatched):
             cam_taken = taken_per_cam.get(cam_id, set())
             for j, gid in enumerate(candidates):
-                # Запрещаем уже занятые на этой камере global_id.
+                # Prevent already taken global_id on this camera.
                 if gid in cam_taken:
                     continue
-                gfeat = self.global_tracks[gid]["smooth_feat"]
-                if fvec is None or gfeat is None:
+                gmeta = self.global_tracks[gid]
+                cost = self._assoc_cost(
+                    fvec, gmeta.get("smooth_feat"), wpt, gmeta.get("world")
+                )
+                if cost is None:
                     continue
-                C[i, j] = self._emb_dist(fvec, gfeat)
+                C[i, j] = cost
 
         s = max(n_u, n_g)
         P = np.full((s, s), COST_INF, dtype=np.float64)
@@ -481,7 +524,7 @@ class MultiCameraTrackingPipeline:
                 continue
             if P[r, c] > self.association_cost_threshold:
                 continue
-            cam_id, local_tid, fvec = unmatched[r]
+            cam_id, local_tid, fvec, wpt = unmatched[r]
             gid = candidates[c]
             if gid in taken_per_cam.get(cam_id, set()):
                 continue
@@ -489,29 +532,17 @@ class MultiCameraTrackingPipeline:
             taken_per_cam.setdefault(cam_id, set()).add(gid)
             used_local.add(r)
             used_global.add(c)
-            g = self.global_tracks[gid]
-            if fvec is not None:
-                if g["smooth_feat"] is None:
-                    g["smooth_feat"] = np.asarray(fvec, dtype=np.float32).copy()
-                else:
-                    alpha = 0.9
-                    g["smooth_feat"] = (
-                        alpha * g["smooth_feat"]
-                        + (1.0 - alpha) * np.asarray(fvec, dtype=np.float32)
-                    )
-                    g["smooth_feat"] /= np.linalg.norm(g["smooth_feat"]) + 1e-12
-            g["last_cam"] = cam_id
-            g["last_frame"] = self.frame_idx
+            self._update_global(gid, cam_id, fvec, wpt)
 
-        for i, (cam_id, local_tid, fvec) in enumerate(unmatched):
+        for i, (cam_id, local_tid, fvec, wpt) in enumerate(unmatched):
             if i in used_local:
                 continue
-            self._new_global(cam_id, local_tid, fvec)
+            self._new_global(cam_id, local_tid, fvec, wpt)
 
         self._resolve_per_cam_gid_conflicts(per_cam_tracks)
 
     def _resolve_per_cam_gid_conflicts(self, per_cam_tracks):
-        """На камере в кадре: один global_id — один local_tid (остальным — новый gid)."""
+        """Per camera per frame: one global_id maps to one local_tid (others get a new gid)."""
         for cam_id, tracks in enumerate(per_cam_tracks):
             if tracks is None or len(tracks) == 0:
                 continue
@@ -533,14 +564,14 @@ class MultiCameraTrackingPipeline:
                     self._new_global(cam_id, local_tid, feats.get(local_tid))
 
     def _candidate_globals_for_unmatched(self, cam_ids):
-        """Объединение кандидатов по всем камерам, с которых есть unmatched."""
+        """Union of candidates across all cameras that have unmatched tracks."""
         seen = set()
         for cam_id in cam_ids:
             for gid in self._candidate_globals(cam_id):
                 seen.add(gid)
         return sorted(seen)
 
-    def _new_global(self, cam_id, local_tid, fvec):
+    def _new_global(self, cam_id, local_tid, fvec, wpt=None):
         gid = self._next_global_id
         self._next_global_id += 1
         key = (cam_id, local_tid)
@@ -552,6 +583,7 @@ class MultiCameraTrackingPipeline:
             feat /= np.linalg.norm(feat) + 1e-12
         self.global_tracks[gid] = {
             "smooth_feat": feat,
+            "world": (float(wpt[0]), float(wpt[1])) if wpt is not None else None,
             "last_cam": cam_id,
             "last_frame": self.frame_idx,
         }
@@ -561,14 +593,14 @@ class MultiCameraTrackingPipeline:
         self._local_absent_frames.pop(key, None)
 
     def _prune_stale_local_mappings(self, per_cam_tracks):
-        """Снимаем (cam, local_tid)→gid по состоянию SCT-трека.
+        """Drop (cam, local_tid)->gid mappings based on the SCT track state.
 
-        * ``state == "lost"`` и с ``last_frame`` прошло >= N кадров — объект
-          на этой камере считаем завершённым, маппинг удаляем.
-        * ``local_tid`` снова появился после пропажи — вероятное переиспользование
-          id трекером, маппинг сбрасываем до новой ассоциации.
-        * N = ``mapping_clear_after_lost_frames`` (по умолчанию как
-          ``max_history_gap_frames`` в SCT, обычно 30).
+        * ``state == "lost"`` and >= N frames passed since ``last_frame`` — the
+          object on this camera is considered finished, the mapping is removed.
+        * ``local_tid`` reappeared after being absent — likely id reuse by the
+          tracker, so the mapping is reset until a new association.
+        * N = ``mapping_clear_after_lost_frames`` (defaults to the SCT
+          ``max_history_gap_frames``, usually 30).
         """
         n_clear = self.mapping_clear_after_lost_frames
 
@@ -626,15 +658,20 @@ class MultiCameraTrackingPipeline:
         if save and video_dir is not None:
             video_dir.mkdir(parents=True, exist_ok=True)
 
+        fps = FpsCollector(num_cameras=len(self.sources))
+
         try:
             while True:
+                t_frame = fps.begin_frame()
                 frames = self.camera_manager.read_frames()
                 if all(f is None for f in frames):
                     break
 
                 per_cam_tracks = self._step_sct(frames)
+                t_after_sct = time.perf_counter()
                 self._prune_stale_local_mappings(per_cam_tracks)
                 self._associate_cross_camera(per_cam_tracks)
+                t_after_mcmt = time.perf_counter()
 
                 if self.mcmt_writer is not None:
                     for cam_idx, tracks in enumerate(per_cam_tracks):
@@ -695,6 +732,13 @@ class MultiCameraTrackingPipeline:
                     )
 
                 self.frame_idx += 1
+                fps.end_frame(
+                    t_frame,
+                    t_after_sct,
+                    t_after_mcmt,
+                    frames,
+                    self.per_cam_pipelines,
+                )
                 if visualize and cv2.waitKey(1) & 0xFF == ord("q"):
                     break
         finally:
@@ -711,6 +755,7 @@ class MultiCameraTrackingPipeline:
                 print(f"[MCMT] AICity track file: {paths['aicity']}")
                 print(f"[MCMT] Per-cam (global ids) dir: {paths['per_cam'][self.cam_ids[0]].parent}")
                 print(f"[MCMT] Per-cam (local ids) dir:  {paths['per_cam_local'][self.cam_ids[0]].parent}")
+            fps.save(self.results_dir)
 
 def load_pipeline_config(config_path):
     config_file = Path(config_path)

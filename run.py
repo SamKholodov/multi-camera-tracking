@@ -204,6 +204,12 @@ def run_from_config(config):
             association_cost_threshold=float(
                 multi_cfg.get("association_cost_threshold", 0.35)
             ),
+            association_reid_weight=float(
+                multi_cfg.get("association_reid_weight", 0.5)
+            ),
+            geometry_max_distance=float(
+                multi_cfg.get("geometry_max_distance", 25.0)
+            ),
             max_cross_cam_gap_frames=int(
                 multi_cfg.get("max_cross_cam_gap_frames", 300)
             ),
@@ -232,7 +238,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
-        default="config/baseline.yml",
+        default="config/baseline.yaml",
         help="Path to YAML config file",
     )
     args = parser.parse_args()
