@@ -26,15 +26,37 @@ from core.utils.fps import FpsCollector, sct_timing_ms
 from core.utils.utilities import Utils
 from core.visualization.visualizer import Visualizer
 
+def _build_reid_backend(reid_weights, device, half):
+    """Local ReID backend with ``get_features(xyxys, img)`` for DeepOcSort."""
+    from core.reid.core import ReID
+
+    kwargs = dict(device=device, half=half)
+    if reid_weights is not None:
+        kwargs["weights"] = reid_weights
+    return ReID(**kwargs).model
+
+
 def _create_tracker(tracker_config):
     """Build Sort, BotSort, or DeepOcSort tracker from YAML ``tracker`` dict."""
     cfg = dict(tracker_config or {})
     tracker_type = str(cfg.pop("type", "botsort")).lower().strip()
     reid_keys = ("reid_weights", "device", "half", "use_default_reid", "use_embeddings", "custom_reid_extractor")
     if tracker_type in ("deepocsort", "deep_ocsort"):
-        for k in reid_keys:
-            cfg.pop(k, None)
-        return DeepOcSortTracker(**cfg)
+        use_embeddings = bool(cfg.pop("use_embeddings", False))
+        reid_weights = cfg.pop("reid_weights", None)
+        device = cfg.pop("device", 0)
+        half = bool(cfg.pop("half", False))
+        cfg.pop("use_default_reid", None)
+        custom_reid_extractor = cfg.pop("custom_reid_extractor", None)
+        reid_model = None
+        if use_embeddings:
+            reid_model = _build_reid_backend(reid_weights, device, half)
+        return DeepOcSortTracker(
+            reid_model=reid_model,
+            use_embeddings=use_embeddings,
+            custom_reid_extractor=custom_reid_extractor,
+            **cfg,
+        )
     if tracker_type == "sort":
         for k in reid_keys:
             cfg.pop(k, None)
