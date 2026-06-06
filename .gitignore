@@ -66,6 +66,12 @@ tracks_history.json
 wandb/
 runs/
 
+# Vehicle ReID datasets (VeRi-776, VRIC — download separately)
+reid_datasets/
+
+# IDE / Cursor
+.cursor/
+
 # Legacy entry point (use run.py)
 main.py
 

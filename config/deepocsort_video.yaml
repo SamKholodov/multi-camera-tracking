@@ -1,11 +1,11 @@
 # Single-camera DeepOCSORT on a file (no ReID embeddings by default).
 # Set single_camera.source to your MP4 path, then:
-#   python run.py --config config/deepocsort_video.yml
+#   python run.py --config config/deepocsort_video.yaml
 
 run_mode: single_camera
 
 detector:
-  model: yolov8m.pt
+  model: models/yolov8m.pt
   # Список классов COCO: каждый номер отдельной строкой или одна строка [2, 3, 5, 7].
   # Неверно: "- 2, 3, 5, 7" — YAML даст одну строку, YOLO упадёт в NMS.
   target_classes: [2, 3, 5, 7]

@@ -2,10 +2,26 @@ from typing import Any, Optional, Type
 
 import numpy as np
 
-try:
-    from boxmot import BotSort as _BoxmotBotSort
-except ImportError:
-    _BoxmotBotSort: Optional[Type[Any]] = None
+def _import_boxmot_botsort():
+    """BoxMOT moved BotSort between releases; try known entry points."""
+    candidates = (
+        "boxmot.trackers.bbox.botsort.botsort",  # boxmot >= 19
+        "boxmot.trackers.botsort.botsort",  # older layout (e.g. system site-packages)
+        "boxmot.trackers",  # re-export
+        "boxmot",
+    )
+    for module_path in candidates:
+        try:
+            mod = __import__(module_path, fromlist=["BotSort"])
+            cls = getattr(mod, "BotSort", None)
+            if cls is not None:
+                return cls
+        except ImportError:
+            continue
+    return None
+
+
+_BoxmotBotSort = _import_boxmot_botsort()
 
 
 class BotSortTracker:
@@ -20,10 +36,7 @@ class BotSortTracker:
         self.use_default_reid = bool(use_default_reid)
         self.custom_reid_extractor = custom_reid_extractor
 
-        tracker_kwargs = dict(
-            reid_weights=reid_weights if self.use_default_reid else None,
-            device=device,
-            half=half,
+        common = dict(
             track_high_thresh=0.5,
             track_low_thresh=0.15,
             new_track_thresh=0.4,
@@ -31,20 +44,35 @@ class BotSortTracker:
             match_thresh=0.7,
             proximity_thresh=0.7,
             appearance_thresh=0.35,
+            with_reid=self.use_default_reid,
         )
-        if not self.use_default_reid:
-            tracker_kwargs["with_reid"] = False
 
         if _BoxmotBotSort is None:
             raise ImportError(
                 "BotSort requires the 'boxmot' package. Install it with: pip install boxmot\n"
                 "Or switch tracker.type to 'deepocsort' in your YAML (no boxmot needed)."
             )
+
+        # boxmot >= 19: reid_model=...; older: reid_weights + device + half
         try:
-            self.tracker = _BoxmotBotSort(**tracker_kwargs)
+            if self.use_default_reid:
+                self.tracker = _BoxmotBotSort(
+                    reid_weights=reid_weights,
+                    device=device,
+                    half=half,
+                    **common,
+                )
+            else:
+                self.tracker = _BoxmotBotSort(**common)
         except TypeError:
-            tracker_kwargs.pop("with_reid", None)
-            self.tracker = _BoxmotBotSort(**tracker_kwargs)
+            common.pop("with_reid", None)
+            if self.use_default_reid:
+                self.tracker = _BoxmotBotSort(
+                    reid_model=reid_weights,
+                    **common,
+                )
+            else:
+                self.tracker = _BoxmotBotSort(with_reid=False, **common)
 
     @staticmethod
     def _normalize_embeddings(features, expected_count):

@@ -216,25 +216,38 @@ class ReID:
         with torch.no_grad():
             return self.model.forward(payload["batch"])
 
-    def postprocess(self, features, **kwargs) -> np.ndarray:
-        """Move features to numpy and L2-normalize them."""
+    def postprocess(self, features, *, return_view: bool = False, **kwargs):
+        """Move features to numpy and L2-normalize embeddings."""
         if features is None:
-            return np.empty((0, 0), dtype=np.float32)
+            empty = np.empty((0, 0), dtype=np.float32)
+            return (empty, np.empty((0,), dtype=np.int64)) if return_view else empty
         if isinstance(features, dict) and "_features" in features:
             return np.asarray(features["_features"], dtype=np.float32)
-        if not hasattr(self.model, "inference_postprocess"):
-            return np.asarray(features, dtype=np.float32)
-        features = np.asarray(self.model.inference_postprocess(features), dtype=np.float32)
-        if features.size == 0:
-            return np.empty((0, 0), dtype=np.float32)
-        norms = np.linalg.norm(features, axis=-1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return features / norms
 
-    def __call__(self, inputs, boxes=None, **kwargs) -> np.ndarray:
+        view_ids = None
+        if isinstance(features, dict) and "view_logits" in features:
+            view_ids = features["view_logits"].argmax(dim=1).detach().cpu().numpy()
+
+        if not hasattr(self.model, "inference_postprocess"):
+            embeddings = np.asarray(features, dtype=np.float32)
+        else:
+            embeddings = np.asarray(self.model.inference_postprocess(features), dtype=np.float32)
+
+        if embeddings.size == 0:
+            empty = np.empty((0, 0), dtype=np.float32)
+            return (empty, np.empty((0,), dtype=np.int64)) if return_view else empty
+
+        norms = np.linalg.norm(embeddings, axis=-1, keepdims=True)
+        norms[norms == 0] = 1.0
+        embeddings = embeddings / norms
+        if return_view:
+            return embeddings, view_ids if view_ids is not None else np.empty((0,), dtype=np.int64)
+        return embeddings
+
+    def __call__(self, inputs, boxes=None, *, return_view: bool = False, **kwargs):
         payload = self.preprocess(inputs, boxes=boxes, **kwargs)
         features = self.process(payload, boxes=boxes, **kwargs)
-        return self.postprocess(features, boxes=boxes, **kwargs)
+        return self.postprocess(features, boxes=boxes, return_view=return_view, **kwargs)
 
 
 __all__ = ("ReID",)

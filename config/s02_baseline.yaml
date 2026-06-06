@@ -14,16 +14,19 @@
 run_mode: multi_camera
 
 detector:
-  model: yolo26m.pt
+  model: models/yolo26m.pt
   # COCO: 2=car, 3=motorbike, 5=bus, 7=truck. CityFlow tracks vehicles only.
   target_classes: [2, 3, 5, 7]
-  conf_thres: 0.4
+  conf_thres: 0.6
   device: 0
 
 tracker:
   type: deepocsort
   use_embeddings: true
-  det_thresh: 0.4
+  reid_weights: models/osnet_ibn_x1_0_msmt17.pt
+  device: 0
+  half: false
+  det_thresh: 0.6
   max_age: 30
   min_hits: 5
   iou_threshold: 0.3
@@ -43,6 +46,8 @@ multi_camera:
   # ROI: "auto" loads <video_dir>/roi.jpg (CityFlow bottom-center rule)
   roi: auto
   association_cost_threshold: 0.25
+  association_reid_weight: 0.5
+  geometry_max_distance: 25.0
   max_cross_cam_gap_frames: 300
   max_history_gap_frames: 30
   results_dir: outputs/s02_baseline

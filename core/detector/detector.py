@@ -14,7 +14,8 @@ class Detector:
         device: Optional[Union[str, int]] = None,
         conf_thres: float = 0.3,
     ):
-        if model.startswith("rtdetr"):
+        model_stem = os.path.splitext(os.path.basename(model))[0]
+        if model_stem.startswith("rtdetr"):
             self.model = RTDETR(model)
         else:
             self.model = YOLO(model)
@@ -22,7 +23,7 @@ class Detector:
         self.conf_thres = conf_thres
         self.target_classes = target_classes
 
-        self.model_name = os.path.splitext(os.path.basename(model))[0]
+        self.model_name = model_stem
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:

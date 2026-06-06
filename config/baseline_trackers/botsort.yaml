@@ -1,0 +1,36 @@
+run_mode: multi_camera
+
+detector:
+  model: models/yolov8m.pt
+  target_classes: [2, 3, 5, 7]
+  conf_thres: 0.6
+  device: 0
+
+tracker:
+  type: botsort
+  use_default_reid: false
+  device: 0
+
+multi_camera:
+  cam_ids: [6, 7, 8, 9]
+  sources:
+    - datasets/validation/S02/c006/vdo.avi
+    - datasets/validation/S02/c007/vdo_synch.avi
+    - datasets/validation/S02/c008/vdo_synch.avi
+    - datasets/validation/S02/c009/vdo_synch.avi
+  homos:
+    - datasets/validation/S02/c006/calibration.txt
+    - datasets/validation/S02/c007/calibration.txt
+    - datasets/validation/S02/c008/calibration.txt
+    - datasets/validation/S02/c009/calibration.txt
+  roi: auto
+  association_cost_threshold: 0.25
+  max_cross_cam_gap_frames: 300
+  max_history_gap_frames: 30
+  results_dir: outputs/baseline_trackers/botsort
+
+output:
+  video_fps: 10
+  visualize: false
+  save_video: false
+  output_path: outputs/baseline_trackers/botsort/multicam.mp4

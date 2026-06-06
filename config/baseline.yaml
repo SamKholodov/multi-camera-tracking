@@ -1,7 +1,7 @@
 run_mode: multi_camera
 
 detector:
-  model: yolov8m.pt
+  model: models/yolov8m.pt
   target_classes:
     - 0
   conf_thres: 0.3

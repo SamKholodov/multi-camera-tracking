@@ -1,22 +1,20 @@
-# MCMT on S02 using CityFlow Mask R-CNN detections (det/det_mask_rcnn.txt)
-# instead of on-the-fly YOLO. Video is still read for ReID embeddings in DeepOCSORT.
-#
-# Detection format (datasets/ReadMe.txt):
-#   frame, -1, left, top, width, height, conf, -1, -1, -1
+# S02 detector ablation: YOLO26l + DeepOcSort + MCMT
+# Run: python run.py --config config/s02_baseline/ocsort/detectors/yolo26l.yml
 
 run_mode: multi_camera
 
 detector:
-  source: cityflow_det
-  det_basename: det_mask_rcnn.txt
-  conf_thres: 0.5
+  model: models/yolo26l.pt
+  target_classes: [2, 3, 5, 7]
+  conf_thres: 0.6
+  device: 0
 
 tracker:
   type: deepocsort
-  use_embeddings: true
-  det_thresh: 0.5
+  use_embeddings: false
+  det_thresh: 0.6
   max_age: 30
-  min_hits: 3
+  min_hits: 5
   iou_threshold: 0.3
 
 multi_camera:
@@ -33,11 +31,14 @@ multi_camera:
     - datasets/validation/S02/c009/calibration.txt
   roi: auto
   association_cost_threshold: 0.25
+  association_reid_weight: 0.5
+  geometry_max_distance: 25.0
   max_cross_cam_gap_frames: 300
   max_history_gap_frames: 30
-  results_dir: outputs/s02_maskrcnn_det
+  results_dir: outputs/s02_baseline/ocsort/detectors/yolo26l
 
 output:
+  video_fps: 10
   visualize: false
   save_video: false
-  output_path: outputs/s02_maskrcnn_det/multicam.mp4
+  output_path: outputs/s02_baseline/ocsort/detectors/yolo26l/multicam.mp4

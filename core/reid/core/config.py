@@ -1,5 +1,7 @@
 MODEL_TYPES = [
+    "vehicle_osnet_x1_0",
     "osnet_x0_25",
+    "osnet_x1_0",
     "osnet_ibn_x1_0",
 ]
 

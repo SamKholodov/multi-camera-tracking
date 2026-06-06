@@ -1,0 +1,29 @@
+model: vehicle_osnet_x1_0
+pretrained_path: osnet_x1_0_imagenet.pth
+img_size: [128, 256]
+preprocess: pad_ratio_resize
+datasets: [veri, vric]
+data_dir: reid_datasets
+
+lambda_triplet: 1.0
+lambda_view: 0.2
+num_view_classes: 8
+
+p: 16
+k: 4
+fallback_p: 8
+
+epochs: 120
+warmup_epochs: 10
+lr: 3.5e-4
+weight_decay: 5.0e-4
+label_smooth: 0.1
+margin: 0.3
+val_fraction: 0.1
+
+num_workers: 4
+seed: 42
+device: cuda:0
+project: runs/vehicle_reid
+name: osnet_x1_0_veri_vric
+log_file: osnet_training.log

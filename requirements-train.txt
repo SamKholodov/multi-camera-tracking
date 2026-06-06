@@ -1,0 +1,9 @@
+# Install the CUDA build of torch/torchvision that matches the GPU machine first.
+torch
+torchvision
+Pillow
+tqdm
+PyYAML
+gdown
+numpy
+scipy
