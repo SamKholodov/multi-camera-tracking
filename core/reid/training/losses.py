@@ -49,6 +49,9 @@ class TripletLoss(nn.Module):
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         n = inputs.size(0)
+        if n < 2:
+            return inputs.sum() * 0.0
+
         # Pairwise distance
         dist = torch.pow(inputs, 2).sum(dim=1, keepdim=True).expand(n, n)
         dist = dist + dist.t()
@@ -59,8 +62,20 @@ class TripletLoss(nn.Module):
         mask = targets.expand(n, n).eq(targets.expand(n, n).t())
         dist_ap, dist_an = [], []
         for i in range(n):
-            dist_ap.append(dist[i][mask[i]].max().unsqueeze(0))
-            dist_an.append(dist[i][mask[i] == 0].min().unsqueeze(0))
+            negatives = dist[i][mask[i] == 0]
+            if negatives.numel() == 0:
+                continue
+            positives = dist[i][mask[i]]
+            positives = positives[positives > 0]
+            if positives.numel() == 0:
+                dist_ap.append(dist[i, i].unsqueeze(0))
+            else:
+                dist_ap.append(positives.max().unsqueeze(0))
+            dist_an.append(negatives.min().unsqueeze(0))
+
+        if not dist_ap:
+            return inputs.sum() * 0.0
+
         dist_ap = torch.cat(dist_ap)
         dist_an = torch.cat(dist_an)
 

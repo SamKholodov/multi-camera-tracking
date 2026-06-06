@@ -361,10 +361,11 @@ class VehicleReIDTrainer:
         return DataLoader(
             ds,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=False,
+            drop_last=True,
         )
 
     def _build_ranking_loaders(self, dataset: Any, batch_size: int) -> tuple[DataLoader, DataLoader]:
