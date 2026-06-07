@@ -78,8 +78,14 @@ class VehicleReIDTrainer:
         img_size: Tuple[int, int] = (128, 256),
         preprocess: str = "pad_ratio_resize",
         num_view_classes: int = 8,
+        lambda_id: float = 1.0,
         lambda_triplet: float = 1.0,
         lambda_view: float = 0.2,
+        checkpoint: str | None = None,
+        freeze_backbone: bool = False,
+        freeze_reid_heads: bool = False,
+        best_metric: str = "veri_mAP",
+        eval_ranking: bool = True,
         p: int = 16,
         k: int = 4,
         fallback_p: int = 8,
@@ -106,8 +112,14 @@ class VehicleReIDTrainer:
         self.img_size = img_size
         self.preprocess = preprocess
         self.num_view_classes = num_view_classes
+        self.lambda_id = lambda_id
         self.lambda_triplet = lambda_triplet
         self.lambda_view = lambda_view
+        self.checkpoint = checkpoint
+        self.freeze_backbone = freeze_backbone
+        self.freeze_reid_heads = freeze_reid_heads
+        self.best_metric = best_metric
+        self.eval_ranking = eval_ranking
         self.p = p
         self.k = k
         self.fallback_p = fallback_p
@@ -145,13 +157,38 @@ class VehicleReIDTrainer:
         train_batch_size = effective_p * effective_k
         eval_batch_size = self.batch_size or train_batch_size
 
-        model = self._build_model(num_classes).to(self.device)
+        model_num_classes = num_classes
+        if self.checkpoint:
+            ckpt_meta = torch.load(
+                self.checkpoint, map_location="cpu", weights_only=False
+            )
+            if ckpt_meta.get("num_classes") is not None:
+                model_num_classes = int(ckpt_meta["num_classes"])
+                if model_num_classes != num_classes:
+                    LOGGER.info(
+                        f"Using num_classes={model_num_classes} from checkpoint "
+                        f"(dataset split has {num_classes})."
+                    )
+
+        model = self._build_model(model_num_classes).to(self.device)
+        if self.checkpoint:
+            self._load_checkpoint(model, self.checkpoint)
+        self._apply_freeze(model)
+
         criterion_id = CrossEntropyLabelSmooth(num_classes, epsilon=self.label_smooth)
         criterion_triplet = TripletLoss(margin=self.margin, soft_margin=False)
         criterion_view = nn.CrossEntropyLoss()
 
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if not trainable:
+            raise RuntimeError("No trainable parameters after freeze/checkpoint setup.")
+        LOGGER.info(
+            f"Trainable parameters: {sum(p.numel() for p in trainable):,} / "
+            f"{sum(p.numel() for p in model.parameters()):,}"
+        )
+
         optimizer = torch.optim.Adam(
-            model.parameters(),
+            trainable,
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
@@ -180,7 +217,7 @@ class VehicleReIDTrainer:
         (save_dir / "hparams.json").write_text(json.dumps(hparams, indent=2))
 
         best_epoch = 0
-        best_mAP = 0.0
+        best_score = float("-inf")
         best_path = save_dir / "best.pth"
         history: List[VehicleTrainMetrics] = []
         val_history: List[Dict[str, VehicleValMetrics]] = []
@@ -208,9 +245,9 @@ class VehicleReIDTrainer:
             )
             val_history.append(epoch_vals)
 
-            veri_map = epoch_vals.get("veri", VehicleValMetrics("veri")).val_mAP
-            if veri_map > best_mAP:
-                best_mAP = veri_map
+            epoch_score = self._selection_score(epoch_vals)
+            if epoch_score > best_score:
+                best_score = epoch_score
                 best_epoch = epoch
                 self._save_checkpoint(
                     best_path,
@@ -218,7 +255,7 @@ class VehicleReIDTrainer:
                     optimizer,
                     scheduler,
                     epoch,
-                    best_mAP,
+                    best_score,
                     hparams,
                 )
 
@@ -228,7 +265,7 @@ class VehicleReIDTrainer:
                 optimizer,
                 scheduler,
                 epoch,
-                best_mAP,
+                best_score,
                 hparams,
             )
             if epoch % 5 == 0:
@@ -238,15 +275,15 @@ class VehicleReIDTrainer:
                     optimizer,
                     scheduler,
                     epoch,
-                    best_mAP,
+                    best_score,
                     hparams,
                 )
             self._write_epoch_log(train_metrics, epoch_vals)
-            self._save_metrics(save_dir, history, val_history, best_epoch, best_mAP)
+            self._save_metrics(save_dir, history, val_history, best_epoch, best_score)
 
         return VehicleTrainResult(
             best_epoch=best_epoch,
-            best_mAP=best_mAP,
+            best_mAP=best_score,
             weights_path=best_path,
             history=history,
             val_history=val_history,
@@ -313,16 +350,57 @@ class VehicleReIDTrainer:
         return p, k
 
     def _build_model(self, num_classes: int) -> nn.Module:
+        use_imagenet = self.pretrained_path and not self.checkpoint
         return ReIDModelRegistry.build_model(
             name=self.model_name,
             weights=Path("vehicle_osnet_x1_0.pth"),
             num_classes=num_classes,
             loss="triplet",
-            pretrained=True,
+            pretrained=bool(use_imagenet),
             use_gpu=self.device.type != "cpu",
-            pretrained_path=self.pretrained_path,
+            pretrained_path=self.pretrained_path if use_imagenet else None,
             num_view_classes=self.num_view_classes,
         )
+
+    def _load_checkpoint(self, model: nn.Module, path: str | Path) -> None:
+        ckpt_path = Path(path)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            LOGGER.warning(f"Checkpoint missing keys: {missing}")
+        if unexpected:
+            LOGGER.warning(f"Checkpoint unexpected keys: {unexpected}")
+        LOGGER.info(
+            f"Loaded checkpoint {ckpt_path} "
+            f"(epoch={checkpoint.get('epoch', '?')}, "
+            f"best={checkpoint.get('best_mAP', '?')})"
+        )
+
+    def _apply_freeze(self, model: nn.Module) -> None:
+        if not self.freeze_backbone and not self.freeze_reid_heads:
+            return
+        frozen: list[str] = []
+        if self.freeze_backbone and hasattr(model, "backbone"):
+            for param in model.backbone.parameters():
+                param.requires_grad = False
+            frozen.append("backbone")
+        if self.freeze_reid_heads:
+            for name in ("bottleneck", "classifier", "id_classifier"):
+                module = getattr(model, name, None)
+                if module is not None:
+                    for param in module.parameters():
+                        param.requires_grad = False
+            frozen.append("reid_heads")
+        if frozen:
+            LOGGER.info(f"Frozen modules: {', '.join(frozen)}")
+
+    def _selection_score(self, epoch_vals: dict[str, VehicleValMetrics]) -> float:
+        if self.best_metric == "veri_view_acc":
+            return float(epoch_vals.get("veri", VehicleValMetrics("veri")).val_view_acc or -1.0)
+        return float(epoch_vals.get("veri", VehicleValMetrics("veri")).val_mAP)
 
     def _build_train_loader(
         self,
@@ -462,7 +540,11 @@ class VehicleReIDTrainer:
         loss_view = torch.tensor(0.0, device=self.device)
         if has_view.any():
             loss_view = criterion_view(output["view_logits"][has_view], view_ids[has_view])
-        loss = loss_id + self.lambda_triplet * loss_triplet + self.lambda_view * loss_view
+        loss = (
+            self.lambda_id * loss_id
+            + self.lambda_triplet * loss_triplet
+            + self.lambda_view * loss_view
+        )
         return loss, loss_id, loss_triplet, loss_view
 
     @torch.no_grad()
@@ -487,15 +569,20 @@ class VehicleReIDTrainer:
                 criterion_view,
             )
 
-        model.eval()
-        for name, (query_loader, gallery_loader) in ranking_loaders.items():
-            q_feats, q_pids, q_camids = extract_features(model, query_loader, self.device, desc=f"{name} query")
-            g_feats, g_pids, g_camids = extract_features(model, gallery_loader, self.device, desc=f"{name} gallery")
-            distmat = compute_distance_matrix(q_feats, g_feats)
-            cmc, mAP = evaluate_ranking(distmat, q_pids, g_pids, q_camids, g_camids)
-            result = results.setdefault(name, VehicleValMetrics(dataset=name))
-            result.val_mAP = float(mAP)
-            result.val_rank1 = float(cmc[0]) if len(cmc) else 0.0
+        if self.eval_ranking:
+            model.eval()
+            for name, (query_loader, gallery_loader) in ranking_loaders.items():
+                q_feats, q_pids, q_camids = extract_features(
+                    model, query_loader, self.device, desc=f"{name} query"
+                )
+                g_feats, g_pids, g_camids = extract_features(
+                    model, gallery_loader, self.device, desc=f"{name} gallery"
+                )
+                distmat = compute_distance_matrix(q_feats, g_feats)
+                cmc, mAP = evaluate_ranking(distmat, q_pids, g_pids, q_camids, g_camids)
+                result = results.setdefault(name, VehicleValMetrics(dataset=name))
+                result.val_mAP = float(mAP)
+                result.val_rank1 = float(cmc[0]) if len(cmc) else 0.0
         return results
 
     def _validate_loss(
@@ -637,8 +724,14 @@ class VehicleReIDTrainer:
             "num_view_classes": self.num_view_classes,
             "img_size": list(self.img_size),
             "preprocess": self.preprocess,
+            "lambda_id": self.lambda_id,
             "lambda_triplet": self.lambda_triplet,
             "lambda_view": self.lambda_view,
+            "checkpoint": self.checkpoint,
+            "freeze_backbone": self.freeze_backbone,
+            "freeze_reid_heads": self.freeze_reid_heads,
+            "best_metric": self.best_metric,
+            "eval_ranking": self.eval_ranking,
             "p": effective_p,
             "k": effective_k,
             "batch_size": batch_size,
