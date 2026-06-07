@@ -1,0 +1,53 @@
+# ReID ablation — custom Vehicle OSNet after view-head finetune (VeRi only).
+# Training: config/reid_train/vehicle_osnet_view_finetune.yaml
+# Weights:  runs/vehicle_reid/osnet_view_finetune/best.pth
+#           (or osnet_view_finetune_1/... if the folder already existed)
+# Run: python run.py --config config/reid_ablation/vehicle_osnet_view_finetune.yaml
+
+run_mode: multi_camera
+
+detector:
+  model: models/yolov8m.pt
+  target_classes: [2, 3, 5, 7]
+  conf_thres: 0.6
+  device: 0
+
+tracker:
+  type: deepocsort
+  use_embeddings: true
+  share_reid_model: true
+  reid_weights: runs/vehicle_reid/osnet_x1_0_veri_vric_with_01_view/best.pth
+  reid_preprocess: pad_ratio_resize
+  device: 0
+  half: false
+  det_thresh: 0.6
+  max_age: 30
+  min_hits: 5
+  iou_threshold: 0.3
+
+multi_camera:
+  cam_ids: [6, 7, 8, 9]
+  sources:
+    - datasets/validation/S02/c006/vdo.avi
+    - datasets/validation/S02/c007/vdo_synch.avi
+    - datasets/validation/S02/c008/vdo_synch.avi
+    - datasets/validation/S02/c009/vdo_synch.avi
+  homos:
+    - datasets/validation/S02/c006/calibration.txt
+    - datasets/validation/S02/c007/calibration.txt
+    - datasets/validation/S02/c008/calibration.txt
+    - datasets/validation/S02/c009/calibration.txt
+  roi: auto
+  # Baseline MCMT: cost_thresh=0.25, reid_weight=0.5
+  association_cost_threshold: 0.18
+  association_reid_weight: 0.75
+  geometry_max_distance: 25.0
+  max_cross_cam_gap_frames: 300
+  max_history_gap_frames: 30
+  results_dir: outputs/reid_ablation/vehicle_osnet_view_finetune
+
+output:
+  video_fps: 10
+  visualize: false
+  save_video: false
+  output_path: outputs/reid_ablation/vehicle_osnet_view_finetune/multicam.mp4

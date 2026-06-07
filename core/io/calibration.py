@@ -13,6 +13,7 @@ The inverse may be cached as ``calibration_i2w.txt`` (same format) next to
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Union
 
@@ -134,3 +135,30 @@ def project_world_to_image(
     vec = np.asarray(H_world_to_image, dtype=np.float64) @ np.array([xw, yw, 1.0], dtype=np.float64)
     w = vec[2] if abs(vec[2]) > 1e-12 else 1e-12
     return float(vec[0] / w), float(vec[1] / w)
+
+
+def haversine_distance_m(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    R = 6_371_000.0
+    lat1_r, lon1_r = map(math.radians, (lat1, lon1))
+    lat2_r, lon2_r = map(math.radians, (lat2, lon2))
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def world_gps_distance_m(
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> float:
+    """Distance between two ``(xworld, yworld)`` = ``(lat, lon)`` points."""
+    return haversine_distance_m(a[0], a[1], b[0], b[1])
