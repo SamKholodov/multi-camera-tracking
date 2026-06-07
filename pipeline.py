@@ -19,6 +19,7 @@ from core.io.track_history import save_tracks_history_json
 from core.io.mcmt_writer import MCMTResultWriter
 from core.io.mot_detections import MotDetectionStore
 from core.io.roi import ROIFilter
+from core.mot.appearance import cross_camera_appearance_distance, normalize_appearance_mode
 from core.mot.tracker.bot_sort_tracker import BotSortTracker
 from core.mot.tracker.deepocsort_tracker import DeepOcSortTracker
 from core.mot.tracker.sort_tracker import SortTracker
@@ -70,6 +71,7 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
         "reid_preprocess",
         "share_reid_model",
     )
+    appearance_keys = ("appearance_update", "reid_accum_conf_thresh")
     if tracker_type in ("deepocsort", "deep_ocsort"):
         use_embeddings = bool(cfg.pop("use_embeddings", False))
         reid_weights = cfg.pop("reid_weights", None)
@@ -97,9 +99,11 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
             **cfg,
         )
     if tracker_type == "sort":
-        for k in reid_keys:
+        for k in (*reid_keys, *appearance_keys):
             cfg.pop(k, None)
         return SortTracker(**cfg)
+    for k in (*reid_keys, *appearance_keys):
+        cfg.pop(k, None)
     return BotSortTracker(**cfg)
 
 
@@ -161,7 +165,21 @@ class SingleCameraTrackerPipeline:
             return tracks
         return self.roi_filter.filter_xyxy_array(tracks)
 
+    def _tracker_appearance_maps(self):
+        match_map = {}
+        raw_map = {}
+        count_map = {}
+        tracker = self.tracker
+        if hasattr(tracker, "get_track_feature_map"):
+            match_map = tracker.get_track_feature_map()
+        if hasattr(tracker, "get_track_appearance_raw_map"):
+            raw_map = tracker.get_track_appearance_raw_map()
+        if hasattr(tracker, "get_track_appearance_update_count_map"):
+            count_map = tracker.get_track_appearance_update_count_map()
+        return match_map, raw_map, count_map
+
     def _update_tracks_storage(self, tracks):
+        _, raw_map, count_map = self._tracker_appearance_maps()
         updated_ids = set()
         for t in tracks:
             x1, y1, x2, y2, tid, conf, det_idx, has_detection = t[:8]
@@ -190,7 +208,8 @@ class SingleCameraTrackerPipeline:
                     "projected_bcenters": [projected_bc],
                     "state" : "pending",
                     "cam_id": self.cam_id,
-                    "reid_emb": [],
+                    "reid_emb": None,
+                    "appearance_update_count": 0,
                     "has_detection": [int(has_detection)],
                 }
             else:
@@ -203,6 +222,12 @@ class SingleCameraTrackerPipeline:
                 tr["bottom_centers"].append([bcx, bcy])
                 tr["projected_bcenters"].append(projected_bc)
                 tr["has_detection"].append(int(has_detection))
+
+            raw = raw_map.get(tid)
+            if raw is not None:
+                self.tracks[tid]["reid_emb"] = raw.copy()
+            if tid in count_map:
+                self.tracks[tid]["appearance_update_count"] = int(count_map[tid])
 
         return updated_ids
 
@@ -382,6 +407,12 @@ class MultiCameraTrackingPipeline:
         if detection_files is not None and len(detection_files) != len(self.sources):
             raise ValueError("detection_files length must match sources length")
 
+        tracker_cfg = dict(tracker_config or {})
+        self.appearance_update = normalize_appearance_mode(
+            tracker_cfg.get("appearance_update", "aaf")
+        )
+        self.reid_accum_conf_thresh = tracker_cfg.get("reid_accum_conf_thresh")
+
         self.shared_reid_model = _maybe_build_shared_reid_model(tracker_config)
         self.per_cam_pipelines = [
             SingleCameraTrackerPipeline(
@@ -420,9 +451,8 @@ class MultiCameraTrackingPipeline:
             else max_history_gap_frames
         )
 
-        # global_id -> {smooth_feat, world, last_cam, last_frame}
-        # ``world`` — last projected world coordinates (xworld, yworld)
-        # of the bottom-center point of the bbox; used in geometry cost.
+        # global_id -> {local_appearance, cam_world, cam_last_frame,
+        #               active_cameras, last_seen_cam, last_seen_world}
         self.global_tracks = {}
         self._next_global_id = 1
         # (cam_index, local_track_id) -> global_id
@@ -447,13 +477,19 @@ class MultiCameraTrackingPipeline:
             per_cam_tracks.append(tracks)
         return per_cam_tracks
 
-    def _emb_dist(self, a, b):
-        """Cosine distance for L2-normalized vectors."""
-        a = np.asarray(a, dtype=np.float64).reshape(-1)
-        b = np.asarray(b, dtype=np.float64).reshape(-1)
-        if a.size == 0 or b.size == 0:
-            return 1e9
-        return float(1.0 - np.clip(np.dot(a, b), -1.0, 1.0))
+    def _cam_appearance_maps(self, cam_id):
+        tracker = self.per_cam_pipelines[cam_id].tracker
+        match_map = (
+            tracker.get_track_feature_map()
+            if hasattr(tracker, "get_track_feature_map")
+            else {}
+        )
+        raw_map = (
+            tracker.get_track_appearance_raw_map()
+            if hasattr(tracker, "get_track_appearance_raw_map")
+            else {}
+        )
+        return match_map, raw_map
 
     def _world_point(self, cam_id, row):
         """World coords from enriched row (cols 8–9), else project if homography set."""
@@ -474,12 +510,58 @@ class MultiCameraTrackingPipeline:
             return 0.0
         return min(d / self.geometry_max_distance, 1.0)
 
-    def _assoc_cost(self, fvec, gfeat, wpt, gwpt):
+    @staticmethod
+    def _global_last_frame(meta: dict) -> int | None:
+        cam_last = meta.get("cam_last_frame") or {}
+        if not cam_last:
+            return None
+        return max(cam_last.values())
+
+    def _geometry_cost_for_match(self, query_cam: int, query_wpt, gmeta: dict):
+        """Min geo cost to other active cameras; fallback to last_seen_cam."""
+        if query_wpt is None:
+            return None
+
+        active = gmeta.get("active_cameras") or set()
+        cam_world = gmeta.get("cam_world") or {}
+        refs = [
+            cam_world[c]
+            for c in active
+            if c != query_cam and c in cam_world and cam_world[c] is not None
+        ]
+        if refs:
+            return min(self._geo_cost(query_wpt, r) for r in refs)
+
+        last_cam = gmeta.get("last_seen_cam")
+        last_world = gmeta.get("last_seen_world")
+        if last_cam is None or last_cam == query_cam or last_world is None:
+            return None
+
+        cam_last = gmeta.get("cam_last_frame") or {}
+        last_f = cam_last.get(last_cam)
+        if last_f is None:
+            return None
+        if self.frame_idx - last_f > self.max_cross_cam_gap_frames:
+            return None
+        return self._geo_cost(query_wpt, last_world)
+
+    def _assoc_cost(self, fvec, gid, query_cam, wpt):
         """Combined cost: lambda * ReID + (1 - lambda) * geometry."""
+        gmeta = self.global_tracks[gid]
         reid = None
-        if fvec is not None and gfeat is not None:
-            reid = self._emb_dist(fvec, gfeat)
-        geo = self._geo_cost(wpt, gwpt)
+        if fvec is not None:
+            reid = cross_camera_appearance_distance(
+                fvec,
+                gmeta.get("local_appearance", {}),
+                query_cam,
+                gmeta.get("active_cameras") or set(),
+                gmeta.get("last_seen_cam"),
+                mode=self.appearance_update,
+                cam_last_frame=gmeta.get("cam_last_frame"),
+                frame_idx=self.frame_idx,
+                max_gap_frames=self.max_cross_cam_gap_frames,
+            )
+        geo = self._geometry_cost_for_match(query_cam, wpt, gmeta)
         lam = self.association_reid_weight
         if reid is not None and geo is not None:
             return lam * reid + (1.0 - lam) * geo
@@ -489,29 +571,57 @@ class MultiCameraTrackingPipeline:
             return geo
         return None
 
-    def _update_global(self, gid, cam_id, fvec, wpt):
-        """EMA update of appearance + last world coordinate of global track."""
+    def _update_local_state(self, gid, cam_id, local_tid, raw_feat, wpt):
+        """Update appearance and per-camera world point for one local track."""
         g = self.global_tracks[gid]
-        if fvec is not None:
-            f = np.asarray(fvec, dtype=np.float32)
-            if g.get("smooth_feat") is None:
-                g["smooth_feat"] = f.copy()
-            else:
-                alpha = 0.9
-                g["smooth_feat"] = alpha * g["smooth_feat"] + (1.0 - alpha) * f
-                g["smooth_feat"] /= np.linalg.norm(g["smooth_feat"]) + 1e-12
+        if raw_feat is not None:
+            g.setdefault("local_appearance", {})[(cam_id, int(local_tid))] = np.asarray(
+                raw_feat, dtype=np.float32
+            ).copy()
         if wpt is not None:
-            g["world"] = (float(wpt[0]), float(wpt[1]))
-        g["last_cam"] = cam_id
-        g["last_frame"] = self.frame_idx
+            g.setdefault("cam_world", {})[cam_id] = (float(wpt[0]), float(wpt[1]))
+            g.setdefault("cam_last_frame", {})[cam_id] = self.frame_idx
+
+    def _refresh_active_cameras(self, per_cam_tracks):
+        """Recompute active_cameras per global id; update last_seen on deactivation."""
+        active_local: dict[int, set[int]] = {}
+        for cam_id, tracks in enumerate(per_cam_tracks):
+            if tracks is None or len(tracks) == 0:
+                active_local[cam_id] = set()
+                continue
+            active_local[cam_id] = {int(row[4]) for row in tracks}
+
+        gid_to_cams: dict[int, set[int]] = {}
+        for (cam_id, local_tid), gid in self.local_to_global.items():
+            if local_tid in active_local.get(cam_id, set()):
+                gid_to_cams.setdefault(gid, set()).add(cam_id)
+
+        for gid, gmeta in self.global_tracks.items():
+            prev_active = set(gmeta.get("active_cameras") or set())
+            new_active = gid_to_cams.get(gid, set())
+            dropped = prev_active - new_active
+            if dropped:
+                last_cam = max(dropped, key=lambda c: gmeta.get("cam_last_frame", {}).get(c, -1))
+                gmeta["last_seen_cam"] = last_cam
+                cam_world = gmeta.get("cam_world") or {}
+                if last_cam in cam_world:
+                    gmeta["last_seen_world"] = cam_world[last_cam]
+            gmeta["active_cameras"] = new_active
+
+    def _valid_candidates(self, query_cam, candidates):
+        """Filter global-id candidates (velocity, cam graph, etc.). Stub in v1."""
+        return candidates
 
     def _candidate_globals(self, cam_id):
-        """Global hypotheses from another camera and not too old."""
+        """Global hypotheses not active on query_cam and not too old."""
         out = []
         for gid, meta in self.global_tracks.items():
-            if meta["last_cam"] == cam_id:
+            if cam_id in (meta.get("active_cameras") or set()):
                 continue
-            if self.frame_idx - meta["last_frame"] > self.max_cross_cam_gap_frames:
+            last_f = self._global_last_frame(meta)
+            if last_f is None:
+                continue
+            if self.frame_idx - last_f > self.max_cross_cam_gap_frames:
                 continue
             out.append(gid)
         return out
@@ -521,6 +631,8 @@ class MultiCameraTrackingPipeline:
         Unmatched (cam, local_tid) try to attach to existing global_id
         through linear_sum_assignment; otherwise create a new global_id.
         """
+        self._refresh_active_cameras(per_cam_tracks)
+
         COST_INF = 1e9
         taken_per_cam: dict[int, set] = {}
 
@@ -537,44 +649,69 @@ class MultiCameraTrackingPipeline:
                     taken = taken_per_cam.setdefault(cam_id, set())
                     if gid in taken:
                         # Two active local_tid on the same camera with the same global_id.
-                        feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
-                        self._new_global(cam_id, local_tid, feats.get(local_tid), wpt)
+                        match_map, raw_map = self._cam_appearance_maps(cam_id)
+                        self._new_global(
+                            cam_id,
+                            local_tid,
+                            match_map.get(local_tid),
+                            raw_map.get(local_tid),
+                            wpt,
+                        )
                         gid = self.local_to_global[key]
                     taken.add(gid)
-                    feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
-                    fvec = feats.get(local_tid)
-                    self._update_global(gid, cam_id, fvec, wpt)
+                    match_map, raw_map = self._cam_appearance_maps(cam_id)
+                    self._update_local_state(
+                        gid,
+                        cam_id,
+                        local_tid,
+                        raw_map.get(local_tid),
+                        wpt,
+                    )
                     continue
-                feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
-                fvec = feats.get(local_tid)
-                unmatched.append((cam_id, local_tid, fvec, wpt))
+                match_map, raw_map = self._cam_appearance_maps(cam_id)
+                fvec = match_map.get(local_tid)
+                unmatched.append((cam_id, local_tid, fvec, raw_map.get(local_tid), wpt))
 
         if not unmatched:
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
+            self._refresh_active_cameras(per_cam_tracks)
             return
 
-        candidates = self._candidate_globals_for_unmatched({c for c, _, _, _ in unmatched})
-        if not candidates:
-            for cam_id, local_tid, _f, _w in unmatched:
-                self._new_global(cam_id, local_tid, _f, _w)
+        raw_candidates = self._candidate_globals_for_unmatched(
+            {c for c, _, _, _, _ in unmatched}
+        )
+        if not raw_candidates:
+            for cam_id, local_tid, fvec, raw_feat, wpt in unmatched:
+                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
+            self._refresh_active_cameras(per_cam_tracks)
             return
 
         n_u = len(unmatched)
-        n_g = len(candidates)
-        C = np.full((n_u, n_g), COST_INF, dtype=np.float64)
-        for i, (cam_id, local_tid, fvec, wpt) in enumerate(unmatched):
+        col_entries: dict[int, list[tuple[int, int]]] = {}
+        for i, (cam_id, local_tid, fvec, _raw_feat, wpt) in enumerate(unmatched):
             cam_taken = taken_per_cam.get(cam_id, set())
-            for j, gid in enumerate(candidates):
-                # Prevent already taken global_id on this camera.
+            candidates = self._valid_candidates(cam_id, raw_candidates)
+            for gid in candidates:
                 if gid in cam_taken:
                     continue
-                gmeta = self.global_tracks[gid]
-                cost = self._assoc_cost(
-                    fvec, gmeta.get("smooth_feat"), wpt, gmeta.get("world")
-                )
+                cost = self._assoc_cost(fvec, gid, cam_id, wpt)
                 if cost is None:
                     continue
+                col_entries.setdefault(gid, []).append((i, cost))
+
+        col_gid = sorted(col_entries.keys())
+        n_g = len(col_gid)
+        if n_g == 0:
+            for cam_id, local_tid, fvec, raw_feat, wpt in unmatched:
+                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
+            self._resolve_per_cam_gid_conflicts(per_cam_tracks)
+            self._refresh_active_cameras(per_cam_tracks)
+            return
+
+        C = np.full((n_u, n_g), COST_INF, dtype=np.float64)
+        for j, gid in enumerate(col_gid):
+            for i, cost in col_entries[gid]:
                 C[i, j] = cost
 
         s = max(n_u, n_g)
@@ -591,22 +728,23 @@ class MultiCameraTrackingPipeline:
                 continue
             if P[r, c] > self.association_cost_threshold:
                 continue
-            cam_id, local_tid, fvec, wpt = unmatched[r]
-            gid = candidates[c]
+            cam_id, local_tid, fvec, raw_feat, wpt = unmatched[r]
+            gid = col_gid[c]
             if gid in taken_per_cam.get(cam_id, set()):
                 continue
             self.local_to_global[(cam_id, local_tid)] = gid
             taken_per_cam.setdefault(cam_id, set()).add(gid)
             used_local.add(r)
             used_global.add(c)
-            self._update_global(gid, cam_id, fvec, wpt)
+            self._update_local_state(gid, cam_id, local_tid, raw_feat, wpt)
 
-        for i, (cam_id, local_tid, fvec, wpt) in enumerate(unmatched):
+        for i, (cam_id, local_tid, fvec, raw_feat, wpt) in enumerate(unmatched):
             if i in used_local:
                 continue
-            self._new_global(cam_id, local_tid, fvec, wpt)
+            self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
 
         self._resolve_per_cam_gid_conflicts(per_cam_tracks)
+        self._refresh_active_cameras(per_cam_tracks)
 
     def _resolve_per_cam_gid_conflicts(self, per_cam_tracks):
         """Per camera per frame: one global_id maps to one local_tid (others get a new gid)."""
@@ -626,9 +764,20 @@ class MultiCameraTrackingPipeline:
                 if len(items) <= 1:
                     continue
                 items.sort(key=lambda x: x[1], reverse=True)
-                feats = self.per_cam_pipelines[cam_id].tracker.get_track_feature_map()
+                match_map, raw_map = self._cam_appearance_maps(cam_id)
                 for local_tid, _conf in items[1:]:
-                    self._new_global(cam_id, local_tid, feats.get(local_tid))
+                    wpt = None
+                    for row in tracks:
+                        if int(row[4]) == local_tid:
+                            wpt = self._world_point(cam_id, row)
+                            break
+                    self._new_global(
+                        cam_id,
+                        local_tid,
+                        match_map.get(local_tid),
+                        raw_map.get(local_tid),
+                        wpt,
+                    )
 
     def _candidate_globals_for_unmatched(self, cam_ids):
         """Union of candidates across all cameras that have unmatched tracks."""
@@ -638,26 +787,40 @@ class MultiCameraTrackingPipeline:
                 seen.add(gid)
         return sorted(seen)
 
-    def _new_global(self, cam_id, local_tid, fvec, wpt=None):
+    def _new_global(self, cam_id, local_tid, fvec, raw_feat=None, wpt=None):
         gid = self._next_global_id
         self._next_global_id += 1
         key = (cam_id, local_tid)
         self.local_to_global[key] = gid
         self._local_absent_frames.pop(key, None)
-        feat = None
-        if fvec is not None:
-            feat = np.asarray(fvec, dtype=np.float32).copy()
-            feat /= np.linalg.norm(feat) + 1e-12
+        stored = None
+        if raw_feat is not None:
+            stored = np.asarray(raw_feat, dtype=np.float32).copy()
+        elif fvec is not None:
+            stored = np.asarray(fvec, dtype=np.float32).copy()
+        local_appearance = {}
+        if stored is not None:
+            local_appearance[key] = stored
+        cam_world = {}
+        cam_last_frame = {}
+        if wpt is not None:
+            cam_world[cam_id] = (float(wpt[0]), float(wpt[1]))
+            cam_last_frame[cam_id] = self.frame_idx
         self.global_tracks[gid] = {
-            "smooth_feat": feat,
-            "world": (float(wpt[0]), float(wpt[1])) if wpt is not None else None,
-            "last_cam": cam_id,
-            "last_frame": self.frame_idx,
+            "local_appearance": local_appearance,
+            "cam_world": cam_world,
+            "cam_last_frame": cam_last_frame,
+            "active_cameras": {cam_id},
+            "last_seen_cam": None,
+            "last_seen_world": None,
         }
 
     def _clear_local_mapping(self, key: tuple[int, int]) -> None:
+        gid = self.local_to_global.get(key)
         self.local_to_global.pop(key, None)
         self._local_absent_frames.pop(key, None)
+        if gid is not None and gid in self.global_tracks:
+            self.global_tracks[gid].get("local_appearance", {}).pop(key, None)
 
     def _prune_stale_local_mappings(self, per_cam_tracks):
         """Drop (cam, local_tid)->gid mappings based on the SCT track state.

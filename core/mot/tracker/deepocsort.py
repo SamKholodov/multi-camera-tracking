@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from core.mot.appearance import normalize_appearance_mode, normalized_for_matching, update_appearance
 from core.mot.association import associate, linear_assignment
 from core.mot.linear_models import KalmanFilterXYSR
 from core.mot.tracker.base import BaseTracker
@@ -63,6 +64,8 @@ class KalmanBoxTracker:
         max_obs=50,
         Q_xy_scaling=0.01,
         Q_s_scaling=0.0001,
+        appearance_mode: str = "aaf",
+        reid_accum_conf_thresh: float = 0.0,
     ):
         """
         Initialises a tracker using initial bounding box.
@@ -135,6 +138,9 @@ class KalmanBoxTracker:
         self.delta_t = delta_t
         self.history_observations = deque([], maxlen=self.max_obs)
 
+        self.appearance_mode = normalize_appearance_mode(appearance_mode)
+        self.reid_accum_conf_thresh = float(reid_accum_conf_thresh)
+        self.appearance_update_count = 1 if emb is not None else 0
         self.emb = emb
 
         self.frozen = False
@@ -178,15 +184,21 @@ class KalmanBoxTracker:
             self.kf.update(det)
             self.frozen = True
 
-    def update_emb(self, emb, alpha=0.9):
-        if self.emb is None:
-            self.emb = emb
-        else:
-            self.emb = alpha * self.emb + (1 - alpha) * emb
-        self.emb /= np.linalg.norm(self.emb)
+    def update_emb(self, emb, alpha=0.9, conf=None):
+        if conf is not None and float(conf) < self.reid_accum_conf_thresh:
+            return
+        self.emb = update_appearance(
+            self.emb,
+            emb,
+            mode=self.appearance_mode,
+            alpha=alpha,
+        )
+        self.appearance_update_count += 1
 
     def get_emb(self):
-        return self.emb
+        if self.emb is None:
+            return None
+        return normalized_for_matching(self.emb, self.appearance_mode)
 
     def apply_affine_correction(self, affine):
         m = affine[:, :2]
@@ -270,6 +282,8 @@ class DeepOcSort(BaseTracker):
         inertia: float = 0.2,
         w_association_emb: float = 0.5,
         alpha_fixed_emb: float = 0.95,
+        appearance_update: str = "aaf",
+        reid_accum_conf_thresh: float | None = None,
         aw_param: float = 0.5,
         embedding_off: bool = False,
         cmc_off: bool = False,
@@ -289,6 +303,8 @@ class DeepOcSort(BaseTracker):
         self.inertia = inertia
         self.w_association_emb = w_association_emb
         self.alpha_fixed_emb = alpha_fixed_emb
+        self.appearance_update = normalize_appearance_mode(appearance_update)
+        self.reid_accum_conf_thresh = reid_accum_conf_thresh
         self.aw_param = aw_param
         self.Q_xy_scaling = Q_xy_scaling
         self.Q_s_scaling = Q_s_scaling
@@ -355,14 +371,21 @@ class DeepOcSort(BaseTracker):
             for trk in self.active_tracks:
                 trk.apply_affine_correction(transform)
 
-        trust = (dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
-        af = self.alpha_fixed_emb
-        # From [self.alpha_fixed_emb, 1], goes to 1 as detector is less confident
-        dets_alpha = af + (1 - af) * (1 - trust)
+        accum_conf_thresh = (
+            float(self.reid_accum_conf_thresh)
+            if self.reid_accum_conf_thresh is not None
+            else float(self.det_thresh)
+        )
+        dets_alpha = None
+        if self.appearance_update == "ema":
+            trust = (dets[:, 4] - self.det_thresh) / (1 - self.det_thresh)
+            af = self.alpha_fixed_emb
+            # From [self.alpha_fixed_emb, 1], goes to 1 as detector is less confident
+            dets_alpha = af + (1 - af) * (1 - trust)
 
         # get predicted locations from existing trackers.
         trks = np.zeros((len(self.active_tracks), 5))
-        trk_embs = []
+        trk_embs: list[np.ndarray | None] = []
         to_del = []
         ret = []
         for t, trk in enumerate(trks):
@@ -374,10 +397,20 @@ class DeepOcSort(BaseTracker):
                 trk_embs.append(self.active_tracks[t].get_emb())
         trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
 
-        if len(trk_embs) > 0:
-            trk_embs = np.vstack(trk_embs)
+        if (
+            use_embedding
+            and dets.shape[0] > 0
+            and len(trk_embs) > 0
+            and dets_embs.ndim == 2
+        ):
+            emb_dim = int(dets_embs.shape[1])
+            filled = [
+                e if e is not None else np.zeros(emb_dim, dtype=np.float32)
+                for e in trk_embs
+            ]
+            trk_embs = np.vstack(filled)
         else:
-            trk_embs = np.array(trk_embs)
+            trk_embs = np.empty((len(trk_embs), 0), dtype=np.float32)
 
         for t in reversed(to_del):
             self.active_tracks.pop(t)
@@ -413,7 +446,12 @@ class DeepOcSort(BaseTracker):
         )
         for m in matched:
             self.active_tracks[m[1]].update(dets[m[0], :])
-            self.active_tracks[m[1]].update_emb(dets_embs[m[0]], alpha=dets_alpha[m[0]])
+            alpha = dets_alpha[m[0]] if dets_alpha is not None else 0.9
+            self.active_tracks[m[1]].update_emb(
+                dets_embs[m[0]],
+                alpha=alpha,
+                conf=float(dets[m[0], 4]),
+            )
 
         """
             Second round of associaton by OCR
@@ -444,8 +482,11 @@ class DeepOcSort(BaseTracker):
                     if iou_left[m[0], m[1]] < self.iou_threshold:
                         continue
                     self.active_tracks[trk_ind].update(dets[det_ind, :])
+                    alpha = dets_alpha[det_ind] if dets_alpha is not None else 0.9
                     self.active_tracks[trk_ind].update_emb(
-                        dets_embs[det_ind], alpha=dets_alpha[det_ind]
+                        dets_embs[det_ind],
+                        alpha=alpha,
+                        conf=float(dets[det_ind, 4]),
                     )
                     to_remove_det_indices.append(det_ind)
                     to_remove_trk_indices.append(trk_ind)
@@ -461,14 +502,25 @@ class DeepOcSort(BaseTracker):
 
         # create and initialise new trackers for unmatched detections
         for i in unmatched_dets:
+            det_conf = float(dets[i, 4])
+            init_emb = None
+            if use_embedding and det_conf >= accum_conf_thresh:
+                init_emb = update_appearance(
+                    None,
+                    dets_embs[i],
+                    mode=self.appearance_update,
+                    alpha=dets_alpha[i] if dets_alpha is not None else 0.9,
+                )
             trk = KalmanBoxTracker(
                 dets[i],
                 delta_t=self.delta_t,
-                emb=dets_embs[i],
-                alpha=dets_alpha[i],
+                emb=init_emb,
+                alpha=dets_alpha[i] if dets_alpha is not None else 0.0,
                 Q_xy_scaling=self.Q_xy_scaling,
                 Q_s_scaling=self.Q_s_scaling,
                 max_obs=self.max_obs,
+                appearance_mode=self.appearance_update,
+                reid_accum_conf_thresh=accum_conf_thresh,
             )
             self.active_tracks.append(trk)
         i = len(self.active_tracks)

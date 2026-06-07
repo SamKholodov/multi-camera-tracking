@@ -75,16 +75,24 @@ class DeepOcSortTracker:
 
         return np.array(out, dtype=np.float32)
 
-    def get_track_feature_map(self):
-        feature_map = {}
+    def _iter_active_track_objects(self):
         inner = getattr(self, "tracker", None)
         if inner is None:
-            return feature_map
-
+            return
         for obj in getattr(inner, "active_tracks", []):
             tid = int(getattr(obj, "id", -1))
             if tid < 0:
                 continue
+            yield tid, obj
+
+    def get_track_feature_map(self):
+        from core.mot.appearance import normalized_for_matching
+
+        feature_map = {}
+        inner = getattr(self, "tracker", None)
+        appearance_mode = getattr(inner, "appearance_update", "aaf") if inner else "aaf"
+
+        for tid, obj in self._iter_active_track_objects():
             feat = getattr(obj, "emb", None)
             if feat is None:
                 continue
@@ -93,6 +101,27 @@ class DeepOcSortTracker:
             except Exception:
                 continue
             if feat.size > 0:
-                feature_map[tid] = feat
+                feature_map[tid] = normalized_for_matching(feat, appearance_mode)
 
         return feature_map
+
+    def get_track_appearance_raw_map(self):
+        """Raw appearance storage per track (AAF sum or EMA-normalized vector)."""
+        feature_map = {}
+        for tid, obj in self._iter_active_track_objects():
+            feat = getattr(obj, "emb", None)
+            if feat is None:
+                continue
+            try:
+                feat = np.asarray(feat, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            if feat.size > 0:
+                feature_map[tid] = feat.copy()
+        return feature_map
+
+    def get_track_appearance_update_count_map(self):
+        count_map = {}
+        for tid, obj in self._iter_active_track_objects():
+            count_map[tid] = int(getattr(obj, "appearance_update_count", 0))
+        return count_map
