@@ -7,7 +7,7 @@ import yaml
 from scipy.optimize import linear_sum_assignment
 
 from core.detector.detector import Detector
-from core.io.calibration import project_bbox_bottom_center, world_gps_distance_m
+from core.io.calibration import project_bbox_bottom_center
 from core.io.camera_manager import CameraManager
 from core.mot.types import (
     TRACK_NCOLS,
@@ -481,8 +481,8 @@ class MultiCameraTrackingPipeline:
         #   cost = lambda * reid_cost + (1 - lambda) * geometry_cost.
         # lambda=1.0 -> ReID only (legacy behavior), lambda=0.0 -> geometry only.
         self.association_reid_weight = float(np.clip(association_reid_weight, 0.0, 1.0))
-        # Normalization scale of the geometry cost in meters (haversine on GPS):
-        # geometry_cost = min(dist_m / geometry_max_distance, 1).
+        # Normalization scale of the geometry cost (in homography world units,
+        # usually meters): geometry_cost = min(dist / geometry_max_distance, 1).
         self.geometry_max_distance = float(geometry_max_distance)
         self.max_cross_cam_gap_frames = int(max_cross_cam_gap_frames)
         self.mapping_clear_after_lost_frames = int(
@@ -581,10 +581,10 @@ class MultiCameraTrackingPipeline:
         return None
 
     def _geo_cost(self, a, b):
-        """Normalized haversine distance in meters, [0, 1]."""
+        """Normalized distance in world coordinates, [0, 1]."""
         if a is None or b is None:
             return None
-        d = world_gps_distance_m(a, b)
+        d = float(np.hypot(a[0] - b[0], a[1] - b[1]))
         if self.geometry_max_distance <= 0:
             return 0.0
         return min(d / self.geometry_max_distance, 1.0)
