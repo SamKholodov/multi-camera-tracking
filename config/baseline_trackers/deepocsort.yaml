@@ -12,6 +12,7 @@ detector:
 tracker:
   type: deepocsort
   use_embeddings: true
+  share_reid_model: true  # false = one OSNet instance per camera (more VRAM)
   reid_weights: models/osnet_ibn_x1_0_msmt17.pt
   device: 0
   half: false

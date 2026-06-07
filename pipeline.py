@@ -26,31 +26,70 @@ from core.utils.fps import FpsCollector, sct_timing_ms
 from core.utils.utilities import Utils
 from core.visualization.visualizer import Visualizer
 
-def _build_reid_backend(reid_weights, device, half):
+def _build_reid_backend(reid_weights, device, half, *, preprocess_name=None):
     """Local ReID backend with ``get_features(xyxys, img)`` for DeepOcSort."""
     from core.reid.core import ReID
 
     kwargs = dict(device=device, half=half)
     if reid_weights is not None:
         kwargs["weights"] = reid_weights
+    if preprocess_name is not None:
+        kwargs["preprocess_name"] = preprocess_name
     return ReID(**kwargs).model
 
 
-def _create_tracker(tracker_config):
+def _maybe_build_shared_reid_model(tracker_config):
+    """Build one ReID backend for multi-camera DeepOcSort when sharing is enabled."""
+    cfg = dict(tracker_config or {})
+    if not bool(cfg.get("share_reid_model", True)):
+        return None
+    tracker_type = str(cfg.get("type", "botsort")).lower().strip()
+    if tracker_type not in ("deepocsort", "deep_ocsort"):
+        return None
+    if not bool(cfg.get("use_embeddings", False)):
+        return None
+    return _build_reid_backend(
+        cfg.get("reid_weights"),
+        cfg.get("device", 0),
+        bool(cfg.get("half", False)),
+        preprocess_name=cfg.get("reid_preprocess"),
+    )
+
+
+def _create_tracker(tracker_config, *, shared_reid_model=None):
     """Build Sort, BotSort, or DeepOcSort tracker from YAML ``tracker`` dict."""
     cfg = dict(tracker_config or {})
     tracker_type = str(cfg.pop("type", "botsort")).lower().strip()
-    reid_keys = ("reid_weights", "device", "half", "use_default_reid", "use_embeddings", "custom_reid_extractor")
+    reid_keys = (
+        "reid_weights",
+        "device",
+        "half",
+        "use_default_reid",
+        "use_embeddings",
+        "custom_reid_extractor",
+        "reid_preprocess",
+        "share_reid_model",
+    )
     if tracker_type in ("deepocsort", "deep_ocsort"):
         use_embeddings = bool(cfg.pop("use_embeddings", False))
         reid_weights = cfg.pop("reid_weights", None)
         device = cfg.pop("device", 0)
         half = bool(cfg.pop("half", False))
         cfg.pop("use_default_reid", None)
+        cfg.pop("reid_preprocess", None)
+        cfg.pop("share_reid_model", None)
         custom_reid_extractor = cfg.pop("custom_reid_extractor", None)
         reid_model = None
         if use_embeddings:
-            reid_model = _build_reid_backend(reid_weights, device, half)
+            if shared_reid_model is not None:
+                reid_model = shared_reid_model
+            else:
+                reid_model = _build_reid_backend(
+                    reid_weights,
+                    device,
+                    half,
+                    preprocess_name=tracker_config.get("reid_preprocess"),
+                )
         return DeepOcSortTracker(
             reid_model=reid_model,
             use_embeddings=use_embeddings,
@@ -78,9 +117,13 @@ class SingleCameraTrackerPipeline:
         max_history_gap_frames=30,
         roi_path=None,
         detection_file=None,
+        shared_reid_model=None,
     ):
         self.source = source
-        self.tracker = _create_tracker(tracker_config)
+        self.tracker = _create_tracker(
+            tracker_config,
+            shared_reid_model=shared_reid_model,
+        )
         self.detection_store = None
         if detection_file is not None:
             self.detection_store = MotDetectionStore(
@@ -339,6 +382,7 @@ class MultiCameraTrackingPipeline:
         if detection_files is not None and len(detection_files) != len(self.sources):
             raise ValueError("detection_files length must match sources length")
 
+        self.shared_reid_model = _maybe_build_shared_reid_model(tracker_config)
         self.per_cam_pipelines = [
             SingleCameraTrackerPipeline(
                 source=src,
@@ -354,6 +398,7 @@ class MultiCameraTrackingPipeline:
                 detection_file=(
                     detection_files[i] if detection_files is not None else None
                 ),
+                shared_reid_model=self.shared_reid_model,
             )
             for i, src in enumerate(self.sources)
         ]
