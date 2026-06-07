@@ -87,7 +87,7 @@ class ReID:
                 return self._backend_model
 
         LOGGER.error(
-            "Unsupported ReID weights format. Use .pt (PyTorch) or .onnx; "
+            "Unsupported ReID weights format. Use .pt/.pth (PyTorch) or .onnx; "
             "export TorchScript via core.reid.exporters if needed."
         )
         raise SystemExit(1)
@@ -110,9 +110,9 @@ class ReID:
 
     def model_type(self, path: Path) -> Tuple[bool, bool]:
         p = Path(path)
-        self.check_suffix(p, (".pt", ".onnx"))
+        self.check_suffix(p, (".pt", ".pth", ".onnx"))
         suffix = p.suffix.lower()
-        return suffix == ".pt", suffix == ".onnx"
+        return suffix in (".pt", ".pth"), suffix == ".onnx"
 
     @staticmethod
     def _coerce_boxes(boxes: Any) -> np.ndarray:

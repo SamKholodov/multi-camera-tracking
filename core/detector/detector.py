@@ -31,19 +31,8 @@ class Detector:
         self.model.to(self.device)
         self.model.fuse()
 
-    def detect(self, frame):
-        if frame is None:
-            return [], []
-
-        results = self.model(
-            frame,
-            imgsz=960,
-            conf=self.conf_thres,
-            verbose=False,
-            classes=self.target_classes,
-        )
-
-        res = results[0]
+    @staticmethod
+    def _parse_result(res):
         if res.boxes is None:
             return [], []
 
@@ -57,3 +46,38 @@ class Detector:
             detections.append([*box, float(score), cls])
             labels.append(cls)
         return detections, labels
+
+    def detect(self, frame):
+        if frame is None:
+            return [], []
+
+        results = self.model(
+            frame,
+            imgsz=960,
+            conf=self.conf_thres,
+            verbose=False,
+            classes=self.target_classes,
+        )
+
+        return self._parse_result(results[0])
+
+    def detect_batch(self, frames):
+        """Run one forward pass for all non-None frames; preserve input order."""
+        n = len(frames)
+        out: list[tuple[list, list]] = [([], []) for _ in range(n)]
+        valid_indices = [i for i, frame in enumerate(frames) if frame is not None]
+        if not valid_indices:
+            return out
+
+        valid_frames = [frames[i] for i in valid_indices]
+        results = self.model(
+            valid_frames,
+            imgsz=960,
+            conf=self.conf_thres,
+            verbose=False,
+            classes=self.target_classes,
+        )
+
+        for batch_idx, cam_idx in enumerate(valid_indices):
+            out[cam_idx] = self._parse_result(results[batch_idx])
+        return out

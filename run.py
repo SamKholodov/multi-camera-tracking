@@ -222,6 +222,7 @@ def run_from_config(config):
             roi_paths=_maybe_roi_paths(sources, multi_cfg.get("roi")),
             detection_files=detection_files,
             video_fps=float(output_cfg.get("video_fps", 10)),
+            detector_batch_inference=bool(detector_cfg.get("batch_inference", True)),
         )
         pipeline.run(
             visualize=visualize,

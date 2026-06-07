@@ -122,6 +122,7 @@ class SingleCameraTrackerPipeline:
         roi_path=None,
         detection_file=None,
         shared_reid_model=None,
+        shared_detector=None,
     ):
         self.source = source
         self.tracker = _create_tracker(
@@ -129,11 +130,14 @@ class SingleCameraTrackerPipeline:
             shared_reid_model=shared_reid_model,
         )
         self.detection_store = None
+        self.detector = None
+        self._shared_detector = None
         if detection_file is not None:
             self.detection_store = MotDetectionStore(
                 detection_file, conf_thres=detector_conf_thres
             )
-            self.detector = None
+        elif shared_detector is not None:
+            self._shared_detector = shared_detector
         else:
             if target_classes is None:
                 target_classes = [2, 3, 5, 7]
@@ -270,7 +274,13 @@ class SingleCameraTrackerPipeline:
             else:
                 tr["state"] = "confirmed"
 
-    def process_frame(self, frame, update_storage=True):
+    def process_frame(
+        self,
+        frame,
+        update_storage=True,
+        detections_array=None,
+        det_ms_override=None,
+    ):
         """
         One frame: detection → SCT → (optionally) local history in self.tracks.
         For multicamera, call from a global loop with synchronized frames.
@@ -281,18 +291,25 @@ class SingleCameraTrackerPipeline:
             return np.empty((0, TRACK_NCOLS), dtype=np.float32)
 
         t0 = time.perf_counter()
-        if self.detection_store is not None:
+        if detections_array is not None:
+            detections_array = np.asarray(detections_array, dtype=np.float32)
+            if detections_array.ndim == 1 and detections_array.size > 0:
+                detections_array = detections_array.reshape(1, -1)
+            t1 = t0
+        elif self.detection_store is not None:
             # MOT files use 1-based frame ids; first processed frame has frame_idx 0.
             detections_array = self.detection_store.get(self.frame_idx + 1)
             detections_array = Utils.filter_detections(detections_array)
+            t1 = time.perf_counter()
         else:
-            detections, _ = self.detector.detect(frame)
+            detector = self.detector if self.detector is not None else self._shared_detector
+            detections, _ = detector.detect(frame)
             detections_array = (
                 Utils.filter_detections(np.asarray(detections))
                 if detections is not None and len(detections) > 0
                 else np.empty((0, 6), dtype=np.float32)
             )
-        t1 = time.perf_counter()
+            t1 = time.perf_counter()
         detections_array = self._filter_detections_roi(detections_array)
 
         tracks = self.tracker.update(detections_array, frame)
@@ -300,7 +317,15 @@ class SingleCameraTrackerPipeline:
         tracks = enrich_tracks_world(tracks, self.homo)
         t2 = time.perf_counter()
 
-        self.last_frame_ms = sct_timing_ms(t0, t1, t2)
+        if det_ms_override is not None:
+            track_ms = (t2 - t1) * 1000.0
+            self.last_frame_ms = {
+                "det_ms": float(det_ms_override),
+                "track_ms": track_ms,
+                "sct_ms": float(det_ms_override) + track_ms,
+            }
+        else:
+            self.last_frame_ms = sct_timing_ms(t0, t1, t2)
 
         if update_storage:
             updated_ids = self._update_tracks_storage(tracks)
@@ -380,6 +405,7 @@ class MultiCameraTrackingPipeline:
         roi_paths=None,
         detection_files=None,
         video_fps=10.0,
+        detector_batch_inference=True,
     ):
         self.sources = list(sources)
         self.video_fps = float(video_fps)
@@ -413,6 +439,19 @@ class MultiCameraTrackingPipeline:
         )
         self.reid_accum_conf_thresh = tracker_cfg.get("reid_accum_conf_thresh")
 
+        if target_classes is None:
+            target_classes = [2, 3, 5, 7]
+
+        self.shared_detector = None
+        self._batch_inference_enabled = bool(detector_batch_inference)
+        if detection_files is None:
+            self.shared_detector = Detector(
+                model=model,
+                target_classes=target_classes,
+                conf_thres=detector_conf_thres,
+                device=detector_device,
+            )
+
         self.shared_reid_model = _maybe_build_shared_reid_model(tracker_config)
         self.per_cam_pipelines = [
             SingleCameraTrackerPipeline(
@@ -430,6 +469,7 @@ class MultiCameraTrackingPipeline:
                     detection_files[i] if detection_files is not None else None
                 ),
                 shared_reid_model=self.shared_reid_model,
+                shared_detector=self.shared_detector,
             )
             for i, src in enumerate(self.sources)
         ]
@@ -467,12 +507,51 @@ class MultiCameraTrackingPipeline:
             else None
         )
 
-    def _step_sct(self, frames):
-        """Same path as in SingleCameraTrackerPipeline.process_frame for each camera."""
+    @staticmethod
+    def _detections_to_array(detections) -> np.ndarray:
+        if detections is None or len(detections) == 0:
+            return np.empty((0, 6), dtype=np.float32)
+        return Utils.filter_detections(np.asarray(detections, dtype=np.float32))
+
+    def _step_sct_sequential(self, frames):
         per_cam_tracks = []
         for cam_id, frame in enumerate(frames):
             tracks = self.per_cam_pipelines[cam_id].process_frame(
                 frame, update_storage=True
+            )
+            per_cam_tracks.append(tracks)
+        return per_cam_tracks
+
+    def _step_sct(self, frames):
+        """Detection + SCT per camera; batched YOLO when shared_detector is enabled."""
+        if not (
+            self.shared_detector is not None and self._batch_inference_enabled
+        ):
+            return self._step_sct_sequential(frames)
+
+        try:
+            t_det0 = time.perf_counter()
+            batch_results = self.shared_detector.detect_batch(frames)
+            batch_det_ms = (time.perf_counter() - t_det0) * 1000.0
+        except Exception as exc:
+            print(
+                f"[MCMT] batched detector failed ({exc!r}); "
+                "falling back to sequential detect"
+            )
+            return self._step_sct_sequential(frames)
+
+        n_active = sum(1 for frame in frames if frame is not None)
+        det_ms_per_cam = batch_det_ms / max(n_active, 1)
+
+        per_cam_tracks = []
+        for cam_id, frame in enumerate(frames):
+            detections, _ = batch_results[cam_id]
+            detections_array = self._detections_to_array(detections)
+            tracks = self.per_cam_pipelines[cam_id].process_frame(
+                frame,
+                update_storage=True,
+                detections_array=detections_array,
+                det_ms_override=det_ms_per_cam if frame is not None else None,
             )
             per_cam_tracks.append(tracks)
         return per_cam_tracks
