@@ -137,6 +137,7 @@ def run_from_config(config):
     )
     detector_conf_thres = float(detector_cfg.get("conf_thres", 0.3))
     detector_device = detector_cfg.get("device", None)
+    detector_imgsz = int(detector_cfg.get("imgsz", 960))
 
     visualize = bool(output_cfg.get("visualize", True))
     save_video = bool(output_cfg.get("save_video", False))
@@ -171,6 +172,7 @@ def run_from_config(config):
             target_classes=target_classes,
             detector_conf_thres=detector_conf_thres,
             detector_device=detector_device,
+            detector_imgsz=detector_imgsz,
             cam_id=int(single_cfg.get("cam_id", 0)),
             homo=H_i2w,
             max_history_gap_frames=int(single_cfg.get("max_history_gap_frames", 30)),
@@ -200,6 +202,7 @@ def run_from_config(config):
             target_classes=target_classes,
             detector_conf_thres=detector_conf_thres,
             detector_device=detector_device,
+            detector_imgsz=detector_imgsz,
             homos=_maybe_homographies(multi_cfg.get("homos")),
             association_cost_threshold=float(
                 multi_cfg.get("association_cost_threshold", 0.35)
@@ -208,7 +211,7 @@ def run_from_config(config):
                 multi_cfg.get("association_reid_weight", 0.5)
             ),
             geometry_max_distance=float(
-                multi_cfg.get("geometry_max_distance", 25.0)
+                multi_cfg.get("geometry_max_distance", 8.0)
             ),
             max_cross_cam_gap_frames=int(
                 multi_cfg.get("max_cross_cam_gap_frames", 300)
@@ -223,6 +226,7 @@ def run_from_config(config):
             detection_files=detection_files,
             video_fps=float(output_cfg.get("video_fps", 10)),
             detector_batch_inference=bool(detector_cfg.get("batch_inference", True)),
+            tracker_batch_reid=bool(tracker_cfg.get("batch_reid", False)),
         )
         pipeline.run(
             visualize=visualize,

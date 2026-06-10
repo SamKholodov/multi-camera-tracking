@@ -20,6 +20,7 @@ from core.io.mcmt_writer import MCMTResultWriter
 from core.io.mot_detections import MotDetectionStore
 from core.io.roi import ROIFilter
 from core.mot.appearance import cross_camera_appearance_distance, normalize_appearance_mode
+from core.mot.reid_batch import batch_reid_features
 from core.mot.tracker.bot_sort_tracker import BotSortTracker
 from core.mot.tracker.deepocsort_tracker import DeepOcSortTracker
 from core.mot.tracker.sort_tracker import SortTracker
@@ -70,6 +71,7 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
         "custom_reid_extractor",
         "reid_preprocess",
         "share_reid_model",
+        "batch_reid",
     )
     appearance_keys = ("appearance_update", "reid_accum_conf_thresh")
     if tracker_type in ("deepocsort", "deep_ocsort"):
@@ -116,6 +118,7 @@ class SingleCameraTrackerPipeline:
         target_classes=None,
         detector_conf_thres=0.3,
         detector_device=None,
+        detector_imgsz=960,
         cam_id=0,
         homo=np.eye(3, dtype=np.float64),
         max_history_gap_frames=30,
@@ -146,6 +149,7 @@ class SingleCameraTrackerPipeline:
                 target_classes=target_classes,
                 conf_thres=detector_conf_thres,
                 device=detector_device,
+                imgsz=detector_imgsz,
             )
         self.visualizer = Visualizer()
         self.tracks = {}
@@ -280,6 +284,7 @@ class SingleCameraTrackerPipeline:
         update_storage=True,
         detections_array=None,
         det_ms_override=None,
+        embs_override=None,
     ):
         """
         One frame: detection → SCT → (optionally) local history in self.tracks.
@@ -312,7 +317,7 @@ class SingleCameraTrackerPipeline:
             t1 = time.perf_counter()
         detections_array = self._filter_detections_roi(detections_array)
 
-        tracks = self.tracker.update(detections_array, frame)
+        tracks = self.tracker.update(detections_array, frame, embs=embs_override)
         tracks = self._filter_tracks_roi(tracks)
         tracks = enrich_tracks_world(tracks, self.homo)
         t2 = time.perf_counter()
@@ -393,6 +398,7 @@ class MultiCameraTrackingPipeline:
         target_classes=None,
         detector_conf_thres=0.3,
         detector_device=None,
+        detector_imgsz=960,
         homos=None,
         association_cost_threshold=0.35,
         association_reid_weight=0.5,
@@ -406,6 +412,7 @@ class MultiCameraTrackingPipeline:
         detection_files=None,
         video_fps=10.0,
         detector_batch_inference=True,
+        tracker_batch_reid=False,
     ):
         self.sources = list(sources)
         self.video_fps = float(video_fps)
@@ -450,9 +457,15 @@ class MultiCameraTrackingPipeline:
                 target_classes=target_classes,
                 conf_thres=detector_conf_thres,
                 device=detector_device,
+                imgsz=detector_imgsz,
             )
 
         self.shared_reid_model = _maybe_build_shared_reid_model(tracker_config)
+        self._batch_reid_enabled = bool(tracker_batch_reid)
+        if self._batch_reid_enabled and self.shared_reid_model is None:
+            print("[MCMT] batch_reid requested but no shared ReID model is available; falling back")
+            self._batch_reid_enabled = False
+        self._last_batch_reid_ms = None
         self.per_cam_pipelines = [
             SingleCameraTrackerPipeline(
                 source=src,
@@ -461,6 +474,7 @@ class MultiCameraTrackingPipeline:
                 target_classes=target_classes,
                 detector_conf_thres=detector_conf_thres,
                 detector_device=detector_device,
+                detector_imgsz=detector_imgsz,
                 cam_id=self.cam_ids[i],
                 homo=self.homos[i],
                 max_history_gap_frames=max_history_gap_frames,
@@ -514,6 +528,7 @@ class MultiCameraTrackingPipeline:
         return Utils.filter_detections(np.asarray(detections, dtype=np.float32))
 
     def _step_sct_sequential(self, frames):
+        self._last_batch_reid_ms = None
         per_cam_tracks = []
         for cam_id, frame in enumerate(frames):
             tracks = self.per_cam_pipelines[cam_id].process_frame(
@@ -524,6 +539,7 @@ class MultiCameraTrackingPipeline:
 
     def _step_sct(self, frames):
         """Detection + SCT per camera; batched YOLO when shared_detector is enabled."""
+        self._last_batch_reid_ms = None
         if not (
             self.shared_detector is not None and self._batch_inference_enabled
         ):
@@ -543,15 +559,41 @@ class MultiCameraTrackingPipeline:
         n_active = sum(1 for frame in frames if frame is not None)
         det_ms_per_cam = batch_det_ms / max(n_active, 1)
 
+        detections_per_cam = [
+            self._detections_to_array(detections)
+            for detections, _ in batch_results
+        ]
+        for cam_id, dets in enumerate(detections_per_cam):
+            detections_per_cam[cam_id] = self.per_cam_pipelines[
+                cam_id
+            ]._filter_detections_roi(dets)
+
+        embs_per_cam = [None for _ in frames]
+        if self._batch_reid_enabled:
+            try:
+                t_reid0 = time.perf_counter()
+                embs_per_cam = batch_reid_features(
+                    self.shared_reid_model,
+                    frames,
+                    detections_per_cam,
+                )
+                self._last_batch_reid_ms = (time.perf_counter() - t_reid0) * 1000.0
+            except Exception as exc:
+                print(
+                    f"[MCMT] batched ReID failed ({exc!r}); "
+                    "falling back to per-camera ReID"
+                )
+                embs_per_cam = [None for _ in frames]
+                self._last_batch_reid_ms = None
+
         per_cam_tracks = []
         for cam_id, frame in enumerate(frames):
-            detections, _ = batch_results[cam_id]
-            detections_array = self._detections_to_array(detections)
             tracks = self.per_cam_pipelines[cam_id].process_frame(
                 frame,
                 update_storage=True,
-                detections_array=detections_array,
+                detections_array=detections_per_cam[cam_id],
                 det_ms_override=det_ms_per_cam if frame is not None else None,
+                embs_override=embs_per_cam[cam_id],
             )
             per_cam_tracks.append(tracks)
         return per_cam_tracks
@@ -1047,6 +1089,7 @@ class MultiCameraTrackingPipeline:
                     t_after_mcmt,
                     frames,
                     self.per_cam_pipelines,
+                    batch_reid_ms=self._last_batch_reid_ms,
                 )
                 if visualize and cv2.waitKey(1) & 0xFF == ord("q"):
                     break

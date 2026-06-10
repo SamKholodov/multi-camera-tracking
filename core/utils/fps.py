@@ -24,6 +24,7 @@ def build_fps_report(
     det_ms_per_frame: Optional[Iterable[float]] = None,
     track_ms_per_frame: Optional[Iterable[float]] = None,
     mcmt_ms_per_frame: Optional[Iterable[float]] = None,
+    reid_ms_per_frame: Optional[Iterable[float]] = None,
     warmup_frames: int = FPS_WARMUP_FRAMES,
 ) -> Optional[dict[str, Any]]:
     times = list(frame_times_sec)
@@ -44,13 +45,18 @@ def build_fps_report(
 
     if det_ms_per_frame:
         det = list(det_ms_per_frame)
-        report["avg_det_ms_per_cam"] = round(float(sum(det)) / len(det), 2)
+        avg_det = float(sum(det)) / len(det)
+        report["avg_det_ms_per_cam"] = round(avg_det, 2)
+        report["avg_det_ms_per_sync_frame"] = round(avg_det * max(num_cameras, 1), 2)
     if track_ms_per_frame:
         track = list(track_ms_per_frame)
         report["avg_track_ms_per_cam"] = round(float(sum(track)) / len(track), 2)
     if mcmt_ms_per_frame:
         mcmt = list(mcmt_ms_per_frame)
         report["avg_mcmt_ms"] = round(float(sum(mcmt)) / len(mcmt), 2)
+    if reid_ms_per_frame:
+        reid = list(reid_ms_per_frame)
+        report["avg_reid_ms_per_sync_frame"] = round(float(sum(reid)) / len(reid), 2)
     return report
 
 
@@ -81,6 +87,7 @@ class FpsCollector:
         self.det_ms_samples: list[float] = []
         self.track_ms_samples: list[float] = []
         self.mcmt_ms_samples: list[float] = []
+        self.reid_ms_samples: list[float] = []
 
     def begin_frame(self) -> float:
         return time.perf_counter()
@@ -92,6 +99,7 @@ class FpsCollector:
         t_after_mcmt: float,
         frames: list,
         per_cam_pipelines: list,
+        batch_reid_ms: float | None = None,
     ) -> None:
         self._loop_i += 1
         if self._loop_i <= self.warmup_frames:
@@ -99,6 +107,8 @@ class FpsCollector:
 
         self.frame_times.append(time.perf_counter() - t_frame)
         self.mcmt_ms_samples.append((t_after_mcmt - t_after_sct) * 1000.0)
+        if batch_reid_ms is not None:
+            self.reid_ms_samples.append(float(batch_reid_ms))
         for cam_id, frame in enumerate(frames):
             if frame is None:
                 continue
@@ -115,6 +125,7 @@ class FpsCollector:
             det_ms_per_frame=self.det_ms_samples or None,
             track_ms_per_frame=self.track_ms_samples or None,
             mcmt_ms_per_frame=self.mcmt_ms_samples or None,
+            reid_ms_per_frame=self.reid_ms_samples or None,
             warmup_frames=self.warmup_frames,
         )
 

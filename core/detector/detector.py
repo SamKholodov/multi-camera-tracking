@@ -13,6 +13,7 @@ class Detector:
         target_classes: Union[int, list[int], None] = 0,
         device: Optional[Union[str, int]] = None,
         conf_thres: float = 0.3,
+        imgsz: int = 960,
     ):
         model_stem = os.path.splitext(os.path.basename(model))[0]
         if model_stem.startswith("rtdetr"):
@@ -22,6 +23,7 @@ class Detector:
 
         self.conf_thres = conf_thres
         self.target_classes = target_classes
+        self.imgsz = int(imgsz)
 
         self.model_name = model_stem
         if device is None:
@@ -53,7 +55,7 @@ class Detector:
 
         results = self.model(
             frame,
-            imgsz=960,
+            imgsz=self.imgsz,
             conf=self.conf_thres,
             verbose=False,
             classes=self.target_classes,
@@ -72,7 +74,7 @@ class Detector:
         valid_frames = [frames[i] for i in valid_indices]
         results = self.model(
             valid_frames,
-            imgsz=960,
+            imgsz=self.imgsz,
             conf=self.conf_thres,
             verbose=False,
             classes=self.target_classes,
