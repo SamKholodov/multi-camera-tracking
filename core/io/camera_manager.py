@@ -1,4 +1,5 @@
 import cv2
+from concurrent.futures import ThreadPoolExecutor
 
 
 def read_source_fps(cap, default: float = 10.0) -> float:
@@ -19,15 +20,17 @@ class CameraManager:
             self.caps.append(cap)
             self.fps_list.append(read_source_fps(cap, default=default_fps))
 
-    def read_frames(self):
-        frames = []
-        for cap in self.caps:
-            ret, frame = cap.read()
-            if ret:
-                frames.append(frame)
-            else:
-                frames.append(None)
-        return frames
+    @staticmethod
+    def _read_one(cap):
+        ret, frame = cap.read()
+        return frame if ret else None
+
+    def read_frames(self, parallel: bool = True):
+        if not parallel or len(self.caps) <= 1:
+            return [self._read_one(cap) for cap in self.caps]
+
+        with ThreadPoolExecutor(max_workers=len(self.caps)) as pool:
+            return list(pool.map(self._read_one, self.caps))
 
     def release(self):
         for cap in self.caps:

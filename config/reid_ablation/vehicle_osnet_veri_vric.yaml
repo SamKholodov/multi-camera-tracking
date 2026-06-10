@@ -15,7 +15,6 @@ detector:
 tracker:
   type: deepocsort
   use_embeddings: true
-  share_reid_model: true
   reid_weights: runs/vehicle_reid/osnet_x1_0_veri_vric_1_without_view/best.pth
   reid_preprocess: pad_ratio_resize
   device: 0
@@ -41,7 +40,7 @@ multi_camera:
   # Baseline MCMT: cost_thresh=0.25, reid_weight=0.5
   association_cost_threshold: 0.18
   association_reid_weight: 0.75
-  geometry_max_distance: 25.0
+  geometry_max_distance: 8.0
   max_cross_cam_gap_frames: 300
   max_history_gap_frames: 30
   results_dir: outputs/reid_ablation/vehicle_osnet_veri_vric

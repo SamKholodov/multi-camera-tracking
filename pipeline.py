@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import yaml
 
@@ -40,11 +41,11 @@ def _build_reid_backend(reid_weights, device, half, *, preprocess_name=None):
     return ReID(**kwargs).model
 
 
-def _maybe_build_shared_reid_model(tracker_config):
-    """Build one ReID backend for multi-camera DeepOcSort when sharing is enabled."""
-    cfg = dict(tracker_config or {})
-    if not bool(cfg.get("share_reid_model", True)):
+def _maybe_build_shared_reid_model(tracker_config, *, share_reid_model=True):
+    """Build one shared ReID backend for multi-camera DeepOcSort."""
+    if not share_reid_model:
         return None
+    cfg = dict(tracker_config or {})
     tracker_type = str(cfg.get("type", "botsort")).lower().strip()
     if tracker_type not in ("deepocsort", "deep_ocsort"):
         return None
@@ -411,8 +412,7 @@ class MultiCameraTrackingPipeline:
         roi_paths=None,
         detection_files=None,
         video_fps=10.0,
-        detector_batch_inference=True,
-        tracker_batch_reid=False,
+        share_reid_model=True,
     ):
         self.sources = list(sources)
         self.video_fps = float(video_fps)
@@ -450,7 +450,6 @@ class MultiCameraTrackingPipeline:
             target_classes = [2, 3, 5, 7]
 
         self.shared_detector = None
-        self._batch_inference_enabled = bool(detector_batch_inference)
         if detection_files is None:
             self.shared_detector = Detector(
                 model=model,
@@ -460,11 +459,9 @@ class MultiCameraTrackingPipeline:
                 imgsz=detector_imgsz,
             )
 
-        self.shared_reid_model = _maybe_build_shared_reid_model(tracker_config)
-        self._batch_reid_enabled = bool(tracker_batch_reid)
-        if self._batch_reid_enabled and self.shared_reid_model is None:
-            print("[MCMT] batch_reid requested but no shared ReID model is available; falling back")
-            self._batch_reid_enabled = False
+        self.shared_reid_model = _maybe_build_shared_reid_model(
+            tracker_config, share_reid_model=share_reid_model
+        )
         self._last_batch_reid_ms = None
         self.per_cam_pipelines = [
             SingleCameraTrackerPipeline(
@@ -527,76 +524,94 @@ class MultiCameraTrackingPipeline:
             return np.empty((0, 6), dtype=np.float32)
         return Utils.filter_detections(np.asarray(detections, dtype=np.float32))
 
-    def _step_sct_sequential(self, frames):
-        self._last_batch_reid_ms = None
-        per_cam_tracks = []
-        for cam_id, frame in enumerate(frames):
-            tracks = self.per_cam_pipelines[cam_id].process_frame(
-                frame, update_storage=True
+    def _parallel_read_enabled(self) -> bool:
+        return len(self.sources) > 1
+
+    def _process_one_camera(self, args):
+        cam_id, frame, detections_array, det_ms_override, embs_override = args
+        return self.per_cam_pipelines[cam_id].process_frame(
+            frame,
+            update_storage=True,
+            detections_array=detections_array,
+            det_ms_override=det_ms_override,
+            embs_override=embs_override,
+        )
+
+    def _process_frames_per_cam(
+        self,
+        frames,
+        *,
+        detections_per_cam=None,
+        det_ms_per_cam=None,
+        embs_per_cam=None,
+    ):
+        n = len(frames)
+        detections_per_cam = detections_per_cam or [None for _ in range(n)]
+        embs_per_cam = embs_per_cam or [None for _ in range(n)]
+        tasks = [
+            (
+                cam_id,
+                frames[cam_id],
+                detections_per_cam[cam_id],
+                det_ms_per_cam if frames[cam_id] is not None else None,
+                embs_per_cam[cam_id],
             )
-            per_cam_tracks.append(tracks)
-        return per_cam_tracks
+            for cam_id in range(n)
+        ]
+
+        if n <= 1:
+            return [self._process_one_camera(task) for task in tasks]
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            return list(pool.map(self._process_one_camera, tasks))
 
     def _step_sct(self, frames):
-        """Detection + SCT per camera; batched YOLO when shared_detector is enabled."""
+        """Batched YOLO + batched ReID, then parallel SCT per camera."""
         self._last_batch_reid_ms = None
-        if not (
-            self.shared_detector is not None and self._batch_inference_enabled
-        ):
-            return self._step_sct_sequential(frames)
+        n = len(frames)
 
-        try:
+        if self.shared_detector is not None:
             t_det0 = time.perf_counter()
             batch_results = self.shared_detector.detect_batch(frames)
             batch_det_ms = (time.perf_counter() - t_det0) * 1000.0
-        except Exception as exc:
-            print(
-                f"[MCMT] batched detector failed ({exc!r}); "
-                "falling back to sequential detect"
+            n_active = sum(1 for frame in frames if frame is not None)
+            det_ms_per_cam = batch_det_ms / max(n_active, 1)
+            detections_per_cam = [
+                self._detections_to_array(detections)
+                for detections, _ in batch_results
+            ]
+            for cam_id, dets in enumerate(detections_per_cam):
+                detections_per_cam[cam_id] = self.per_cam_pipelines[
+                    cam_id
+                ]._filter_detections_roi(dets)
+        else:
+            det_ms_per_cam = None
+            detections_per_cam = []
+            for cam in self.per_cam_pipelines:
+                if cam.detection_store is not None:
+                    dets = self._detections_to_array(
+                        cam.detection_store.get(self.frame_idx + 1)
+                    )
+                    detections_per_cam.append(cam._filter_detections_roi(dets))
+                else:
+                    detections_per_cam.append(None)
+
+        embs_per_cam = [None for _ in range(n)]
+        if self.shared_reid_model is not None:
+            t_reid0 = time.perf_counter()
+            embs_per_cam = batch_reid_features(
+                self.shared_reid_model,
+                frames,
+                detections_per_cam,
             )
-            return self._step_sct_sequential(frames)
+            self._last_batch_reid_ms = (time.perf_counter() - t_reid0) * 1000.0
 
-        n_active = sum(1 for frame in frames if frame is not None)
-        det_ms_per_cam = batch_det_ms / max(n_active, 1)
-
-        detections_per_cam = [
-            self._detections_to_array(detections)
-            for detections, _ in batch_results
-        ]
-        for cam_id, dets in enumerate(detections_per_cam):
-            detections_per_cam[cam_id] = self.per_cam_pipelines[
-                cam_id
-            ]._filter_detections_roi(dets)
-
-        embs_per_cam = [None for _ in frames]
-        if self._batch_reid_enabled:
-            try:
-                t_reid0 = time.perf_counter()
-                embs_per_cam = batch_reid_features(
-                    self.shared_reid_model,
-                    frames,
-                    detections_per_cam,
-                )
-                self._last_batch_reid_ms = (time.perf_counter() - t_reid0) * 1000.0
-            except Exception as exc:
-                print(
-                    f"[MCMT] batched ReID failed ({exc!r}); "
-                    "falling back to per-camera ReID"
-                )
-                embs_per_cam = [None for _ in frames]
-                self._last_batch_reid_ms = None
-
-        per_cam_tracks = []
-        for cam_id, frame in enumerate(frames):
-            tracks = self.per_cam_pipelines[cam_id].process_frame(
-                frame,
-                update_storage=True,
-                detections_array=detections_per_cam[cam_id],
-                det_ms_override=det_ms_per_cam if frame is not None else None,
-                embs_override=embs_per_cam[cam_id],
-            )
-            per_cam_tracks.append(tracks)
-        return per_cam_tracks
+        return self._process_frames_per_cam(
+            frames,
+            detections_per_cam=detections_per_cam,
+            det_ms_per_cam=det_ms_per_cam,
+            embs_per_cam=embs_per_cam,
+        )
 
     def _cam_appearance_maps(self, cam_id):
         tracker = self.per_cam_pipelines[cam_id].tracker
@@ -1014,7 +1029,9 @@ class MultiCameraTrackingPipeline:
         try:
             while True:
                 t_frame = fps.begin_frame()
-                frames = self.camera_manager.read_frames()
+                frames = self.camera_manager.read_frames(
+                    parallel=self._parallel_read_enabled()
+                )
                 if all(f is None for f in frames):
                     break
 

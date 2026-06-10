@@ -13,7 +13,6 @@ detector:
 tracker:
   type: deepocsort
   use_embeddings: true
-  share_reid_model: true
   reid_weights: runs/vehicle_reid/osnet_x1_0_veri_vric_with_01_view/best.pth
   reid_preprocess: pad_ratio_resize
   device: 0
