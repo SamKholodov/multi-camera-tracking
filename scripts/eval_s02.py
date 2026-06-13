@@ -20,12 +20,16 @@ results into one stream where each detection's frame index is offset
 by camera_index * 1e6; predicted ids stay global, GT ids stay global
 across cameras (CityFlow GT uses scene-global ids), so IDF1 across the
 concatenated stream is a fair MCMT proxy.
+
+Use --cityflow-protocol for CityFlow-aligned evaluation (ROI + cross-camera
+objects only). Add --full-mot to also print standard MOT metrics.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import Literal
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -44,10 +48,24 @@ except ImportError as e:  # pragma: no cover
         "motmetrics is required for evaluation. Install with: pip install motmetrics"
     ) from e
 
+from core.eval.cityflow_protocol import (
+    PredIdMode,
+    apply_cityflow_filters,
+    infer_pred_id_mode,
+)
 from core.io.roi import ROIFilter
 
+FRAME_GAP = 10_000_000
+SUMMARY_METRICS = [
+    "idf1", "idp", "idr",
+    "mota", "motp",
+    "num_switches", "mostly_tracked", "mostly_lost",
+    "num_false_positives", "num_misses", "num_unique_objects",
+]
+BATCH_METRICS = ["idf1", "idp", "idr", "mota", "motp", "num_false_positives", "num_misses"]
 
-def _load_mot(path: Path) -> np.ndarray:
+
+def load_mot(path: Path) -> np.ndarray:
     """MOT16: frame,id,x,y,w,h,conf,-1,-1,-1 -> ndarray."""
     if not path.exists() or path.stat().st_size == 0:
         return np.empty((0, 10))
@@ -57,6 +75,9 @@ def _load_mot(path: Path) -> np.ndarray:
     if data.ndim == 1:
         data = data.reshape(1, -1)
     return data
+
+
+_load_mot = load_mot
 
 
 def _to_motchallenge_frames(data: np.ndarray):
@@ -74,7 +95,7 @@ def _to_motchallenge_frames(data: np.ndarray):
         yield int(f), ids, boxes
 
 
-def _accumulate(gt: np.ndarray, pred: np.ndarray, max_iou_dist: float = 0.5):
+def accumulate(gt: np.ndarray, pred: np.ndarray, max_iou_dist: float = 0.5):
     acc = mm.MOTAccumulator(auto_id=True)
     gt_by_frame = {f: (ids, boxes) for f, ids, boxes in _to_motchallenge_frames(gt)}
     pr_by_frame = {f: (ids, boxes) for f, ids, boxes in _to_motchallenge_frames(pred)}
@@ -87,18 +108,115 @@ def _accumulate(gt: np.ndarray, pred: np.ndarray, max_iou_dist: float = 0.5):
     return acc
 
 
+_accumulate = accumulate
+
+
+def _apply_roi(gt_root: Path, cam: int, gt: np.ndarray, pr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    roi_path = gt_root / f"c{cam:03d}" / "roi.jpg"
+    if not roi_path.exists():
+        print(f"[WARN] ROI missing for c{cam:03d}: {roi_path}")
+        return gt, pr
+    roi = ROIFilter.from_path(roi_path)
+    return roi.filter_mot(gt), roi.filter_mot(pr)
+
+
+def _resolve_id_mode(pred_dir: Path, pred_id_mode: str) -> PredIdMode:
+    if pred_id_mode == "auto":
+        return infer_pred_id_mode(pred_dir)
+    return pred_id_mode  # type: ignore[return-value]
+
+
+def evaluate_s02(
+    gt_root: Path,
+    pred_dir: Path,
+    cameras: list[int] | None = None,
+    max_iou_dist: float = 0.5,
+    apply_roi: bool = False,
+    cityflow_protocol: bool = False,
+    pred_id_mode: Literal["auto", "global", "local"] = "auto",
+) -> dict:
+    """Load GT/predictions and return per-camera + MCMT metric dicts."""
+    if cameras is None:
+        cameras = [6, 7, 8, 9]
+
+    use_roi = apply_roi or cityflow_protocol
+    id_mode = _resolve_id_mode(pred_dir, pred_id_mode)
+
+    gt_by_cam: dict[int, np.ndarray] = {}
+    pr_by_cam: dict[int, np.ndarray] = {}
+    for cam in cameras:
+        gt_path = gt_root / f"c{cam:03d}" / "gt" / "gt.txt"
+        pr_path = pred_dir / f"c{cam:03d}.txt"
+        if not gt_path.exists():
+            print(f"[WARN] GT missing: {gt_path}")
+            continue
+        gt = load_mot(gt_path)
+        pr = load_mot(pr_path)
+        if use_roi:
+            gt, pr = _apply_roi(gt_root, cam, gt, pr)
+        gt_by_cam[cam] = gt
+        pr_by_cam[cam] = pr
+
+    if not gt_by_cam:
+        raise SystemExit("No GT files found, nothing to evaluate.")
+
+    if cityflow_protocol:
+        pr_by_cam = apply_cityflow_filters(
+            gt_by_cam, pr_by_cam, mode=id_mode, iou_thresh=max_iou_dist
+        )
+
+    accs: dict[str, mm.MOTAccumulator] = {}
+    mcmt_gt_rows: list[np.ndarray] = []
+    mcmt_pr_rows: list[np.ndarray] = []
+    frame_offset = 0
+
+    for cam in cameras:
+        if cam not in gt_by_cam:
+            continue
+        gt = gt_by_cam[cam]
+        pr = pr_by_cam.get(cam, np.empty((0, 10)))
+        accs[f"c{cam:03d}"] = accumulate(gt, pr, max_iou_dist)
+        if len(gt):
+            gt_off = gt.copy()
+            gt_off[:, 0] += frame_offset
+            mcmt_gt_rows.append(gt_off)
+        if len(pr):
+            pr_off = pr.copy()
+            pr_off[:, 0] += frame_offset
+            mcmt_pr_rows.append(pr_off)
+        frame_offset += FRAME_GAP
+
+    mh = mm.metrics.create()
+    per_cam = mh.compute_many(
+        list(accs.values()),
+        names=list(accs.keys()),
+        metrics=BATCH_METRICS,
+        generate_overall=True,
+    )
+
+    mcmt_row = None
+    if mcmt_gt_rows and mcmt_pr_rows:
+        mcmt_acc = accumulate(
+            np.concatenate(mcmt_gt_rows, axis=0),
+            np.concatenate(mcmt_pr_rows, axis=0),
+            max_iou_dist,
+        )
+        mcmt_row = mh.compute(mcmt_acc, metrics=BATCH_METRICS)
+
+    return {
+        "per_cam": per_cam,
+        "mcmt": mcmt_row,
+        "cityflow_protocol": cityflow_protocol,
+        "pred_id_mode": id_mode,
+    }
+
+
 def _print_summary(summaries: dict[str, "mm.MOTAccumulator"]):
     mh = mm.metrics.create()
-    metrics = [
-        "idf1", "idp", "idr",
-        "mota", "motp",
-        "num_switches", "mostly_tracked", "mostly_lost",
-        "num_false_positives", "num_misses", "num_unique_objects",
-    ]
     summary = mh.compute_many(
         list(summaries.values()),
         names=list(summaries.keys()),
-        metrics=metrics,
+        metrics=SUMMARY_METRICS,
         generate_overall=True,
     )
     print(mm.io.render_summary(
@@ -106,6 +224,75 @@ def _print_summary(summaries: dict[str, "mm.MOTAccumulator"]):
         formatters=mh.formatters,
         namemap=mm.io.motchallenge_metric_names,
     ))
+
+
+def _run_eval_pass(
+    gt_root: Path,
+    pred_dir: Path,
+    cameras: list[int],
+    max_iou_dist: float,
+    apply_roi: bool,
+    cityflow_protocol: bool,
+    pred_id_mode: str,
+    title: str,
+):
+    id_mode = _resolve_id_mode(pred_dir, pred_id_mode)
+    use_roi = apply_roi or cityflow_protocol
+
+    gt_by_cam: dict[int, np.ndarray] = {}
+    pr_by_cam: dict[int, np.ndarray] = {}
+    for cam in cameras:
+        gt_path = gt_root / f"c{cam:03d}" / "gt" / "gt.txt"
+        pr_path = pred_dir / f"c{cam:03d}.txt"
+        if not gt_path.exists():
+            print(f"[WARN] GT missing: {gt_path}")
+            continue
+        gt = load_mot(gt_path)
+        pr = load_mot(pr_path)
+        if use_roi:
+            gt, pr = _apply_roi(gt_root, cam, gt, pr)
+        gt_by_cam[cam] = gt
+        pr_by_cam[cam] = pr
+
+    if not gt_by_cam:
+        raise SystemExit("No GT files found, nothing to evaluate.")
+
+    if cityflow_protocol:
+        pr_by_cam = apply_cityflow_filters(
+            gt_by_cam, pr_by_cam, mode=id_mode, iou_thresh=max_iou_dist
+        )
+
+    accs: dict[str, mm.MOTAccumulator] = {}
+    mcmt_gt_rows: list[np.ndarray] = []
+    mcmt_pr_rows: list[np.ndarray] = []
+    frame_offset = 0
+
+    for cam in cameras:
+        if cam not in gt_by_cam:
+            continue
+        gt = gt_by_cam[cam]
+        pr = pr_by_cam.get(cam, np.empty((0, 10)))
+        accs[f"c{cam:03d}"] = accumulate(gt, pr, max_iou_dist)
+        if len(gt):
+            gt_off = gt.copy()
+            gt_off[:, 0] += frame_offset
+            mcmt_gt_rows.append(gt_off)
+        if len(pr):
+            pr_off = pr.copy()
+            pr_off[:, 0] += frame_offset
+            mcmt_pr_rows.append(pr_off)
+        frame_offset += FRAME_GAP
+
+    print(f"\n=== {title} ===")
+    if cityflow_protocol:
+        print(f"(CityFlow protocol: ROI + pred filter, id_mode={id_mode})")
+    _print_summary(accs)
+
+    if mcmt_gt_rows and mcmt_pr_rows:
+        mcmt_gt = np.concatenate(mcmt_gt_rows, axis=0)
+        mcmt_pr = np.concatenate(mcmt_pr_rows, axis=0)
+        print("\n=== Concatenated multi-camera stream ===")
+        _print_summary({"MCMT": accumulate(mcmt_gt, mcmt_pr, max_iou_dist)})
 
 
 def main():
@@ -120,52 +307,57 @@ def main():
         action="store_true",
         help="Filter GT and predictions with datasets/.../cXXX/roi.jpg (CityFlow rule)",
     )
+    ap.add_argument(
+        "--cityflow-protocol",
+        action="store_true",
+        help="CityFlow eval: ROI + cross-camera pred filter (implies --apply-roi)",
+    )
+    ap.add_argument(
+        "--pred-id-mode",
+        choices=["auto", "global", "local"],
+        default="auto",
+        help="auto: infer from per_cam vs per_cam_local in --pred-dir",
+    )
+    ap.add_argument(
+        "--full-mot",
+        action="store_true",
+        help="With --cityflow-protocol, also print standard MOT metrics (no CityFlow filter)",
+    )
     args = ap.parse_args()
 
-    accs: dict[str, "mm.MOTAccumulator"] = {}
-    # Concatenated MCMT stream uses per-cam frame offset to keep frames disjoint.
-    mcmt_gt_rows = []
-    mcmt_pr_rows = []
-    frame_offset = 0
-    FRAME_GAP = 10_000_000
-
-    for cam in args.cameras:
-        gt_path = args.gt_root / f"c{cam:03d}" / "gt" / "gt.txt"
-        pr_path = args.pred_dir / f"c{cam:03d}.txt"
-        if not gt_path.exists():
-            print(f"[WARN] GT missing: {gt_path}")
-            continue
-        gt = _load_mot(gt_path)
-        pr = _load_mot(pr_path)
-        if args.apply_roi:
-            roi_path = args.gt_root / f"c{cam:03d}" / "roi.jpg"
-            if roi_path.exists():
-                roi = ROIFilter.from_path(roi_path)
-                gt = roi.filter_mot(gt)
-                pr = roi.filter_mot(pr)
-            else:
-                print(f"[WARN] ROI missing for c{cam:03d}: {roi_path}")
-        accs[f"c{cam:03d}"] = _accumulate(gt, pr, args.max_iou_dist)
-
-        if len(gt):
-            gt_off = gt.copy(); gt_off[:, 0] += frame_offset
-            mcmt_gt_rows.append(gt_off)
-        if len(pr):
-            pr_off = pr.copy(); pr_off[:, 0] += frame_offset
-            mcmt_pr_rows.append(pr_off)
-        frame_offset += FRAME_GAP
-
-    if not accs:
-        raise SystemExit("No GT files found, nothing to evaluate.")
-
-    print("\n=== Per-camera (cross-cam ID-aware if pred uses global ids) ===")
-    _print_summary(accs)
-
-    if mcmt_gt_rows and mcmt_pr_rows:
-        mcmt_gt = np.concatenate(mcmt_gt_rows, axis=0)
-        mcmt_pr = np.concatenate(mcmt_pr_rows, axis=0)
-        print("\n=== Concatenated multi-camera stream ===")
-        _print_summary({"MCMT": _accumulate(mcmt_gt, mcmt_pr, args.max_iou_dist)})
+    if args.cityflow_protocol:
+        _run_eval_pass(
+            args.gt_root,
+            args.pred_dir,
+            args.cameras,
+            args.max_iou_dist,
+            apply_roi=args.apply_roi,
+            cityflow_protocol=True,
+            pred_id_mode=args.pred_id_mode,
+            title="Per-camera (CityFlow protocol)",
+        )
+        if args.full_mot:
+            _run_eval_pass(
+                args.gt_root,
+                args.pred_dir,
+                args.cameras,
+                args.max_iou_dist,
+                apply_roi=args.apply_roi,
+                cityflow_protocol=False,
+                pred_id_mode=args.pred_id_mode,
+                title="Per-camera (full MOT)",
+            )
+    else:
+        _run_eval_pass(
+            args.gt_root,
+            args.pred_dir,
+            args.cameras,
+            args.max_iou_dist,
+            apply_roi=args.apply_roi,
+            cityflow_protocol=False,
+            pred_id_mode=args.pred_id_mode,
+            title="Per-camera (cross-cam ID-aware if pred uses global ids)",
+        )
 
 
 if __name__ == "__main__":

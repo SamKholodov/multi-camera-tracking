@@ -32,8 +32,10 @@ class DeepOcSortTracker:
             return None
 
         norms = np.linalg.norm(features, axis=1, keepdims=True)
-        norms = np.clip(norms, 1e-12, None)
-        return features / norms
+        out = features.copy()
+        mask = norms.squeeze(-1) > 1e-12
+        out[mask] /= norms[mask]
+        return out
 
     def _compute_embeddings(self, dets, frame):
         if callable(self.custom_reid_extractor):

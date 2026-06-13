@@ -24,6 +24,7 @@ multi_camera:
   sources: []
   homos: null
   association_cost_threshold: 0.35
+  use_temporal_decay: false
   max_cross_cam_gap_frames: 300
   max_history_gap_frames: 30
 

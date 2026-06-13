@@ -18,6 +18,8 @@ ENV/
 # IDE
 .vscode/
 .idea/
+pyrightconfig.json
+pyproject.toml
 *.swp
 *.swo
 
@@ -61,10 +63,13 @@ datasets/validation/S02/gt_for_eval.txt
 *.zip
 
 # Local runs / debug
+commands.local.yaml
 tracks_history.json
 *.log
 wandb/
 runs/
+polygons_output/
+check_dist/
 
 # Vehicle ReID datasets (VeRi-776, VRIC — download separately)
 reid_datasets/

@@ -9,13 +9,14 @@ import tarfile
 import traceback
 import numpy as np
 
-# motmetrics 1.4.x still calls np.asfarray (removed in NumPy 2.0).
+# motmetrics 1.4.0 still calls np.asfarray (removed in NumPy 2.0).
 if not hasattr(np, "asfarray"):
     np.asfarray = lambda a, dtype=np.float64: np.asarray(a, dtype=dtype)  # type: ignore[attr-defined]
 
 import pandas as pd
 import scipy as sp
 import motmetrics as mm
+import pytrec_eval as trec
 from PIL import Image
 from collections import defaultdict
 from argparse import ArgumentParser
@@ -259,7 +260,7 @@ def eval(test, pred, **kwargs):
             ymin = int(row['Y'])
             xmax = int(row['X'] + row['Width'])
             ymax = int(row['Y'] + row['Height'])
-
+        
             if xmin >= 0 and xmin < width:
                 if ymin >= 0 and ymin < height and roi[ymin, xmin] < 255:
                     return True

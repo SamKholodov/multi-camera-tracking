@@ -8,7 +8,7 @@ import yaml
 from scipy.optimize import linear_sum_assignment
 
 from core.detector.detector import Detector
-from core.io.calibration import project_bbox_bottom_center
+from core.io.calibration import project_bbox_bottom_center, world_gps_distance_m
 from core.io.camera_manager import CameraManager
 from core.mot.types import (
     TRACK_NCOLS,
@@ -20,7 +20,19 @@ from core.io.track_history import save_tracks_history_json
 from core.io.mcmt_writer import MCMTResultWriter
 from core.io.mot_detections import MotDetectionStore
 from core.io.roi import ROIFilter
-from core.mot.appearance import cross_camera_appearance_distance, normalize_appearance_mode
+from core.io.zones import ZoneMap
+from core.mot.appearance import normalize_appearance_mode
+from core.mot.association.cross_camera import (
+    association_cost_for_match,
+    CrossCameraAssociationConfig,
+    geometry_penalty,
+    min_overlap_distance_m,
+    passes_gates,
+    passes_hard_gates,
+    temporal_penalty,
+)
+from core.mot.global_track import CamObservation, GlobalTrackStore
+from core.mot.local_zone_state import LocalZoneTracker
 from core.mot.reid_batch import batch_reid_features
 from core.mot.tracker.bot_sort_tracker import BotSortTracker
 from core.mot.tracker.deepocsort_tracker import DeepOcSortTracker
@@ -407,12 +419,14 @@ class MultiCameraTrackingPipeline:
         max_cross_cam_gap_frames=300,
         max_history_gap_frames=30,
         mapping_clear_after_lost_frames=None,
+        use_temporal_decay=False,
         cam_ids=None,
         results_dir=None,
         roi_paths=None,
         detection_files=None,
         video_fps=10.0,
         share_reid_model=True,
+        association_config=None,
     ):
         self.sources = list(sources)
         self.video_fps = float(video_fps)
@@ -445,6 +459,8 @@ class MultiCameraTrackingPipeline:
             tracker_cfg.get("appearance_update", "aaf")
         )
         self.reid_accum_conf_thresh = tracker_cfg.get("reid_accum_conf_thresh")
+        batch_size = tracker_cfg.get("reid_batch_size")
+        self.reid_batch_size = int(batch_size) if batch_size is not None else None
 
         if target_classes is None:
             target_classes = [2, 3, 5, 7]
@@ -487,24 +503,34 @@ class MultiCameraTrackingPipeline:
         self.visualizer = Visualizer()
 
         self.frame_idx = 0
-        self.association_cost_threshold = float(association_cost_threshold)
-        # Weight of the appearance (ReID) term in the total association cost:
-        #   cost = lambda * reid_cost + (1 - lambda) * geometry_cost.
-        # lambda=1.0 -> ReID only (legacy behavior), lambda=0.0 -> geometry only.
+        if association_config is None:
+            association_config = {
+                "association_cost_threshold": association_cost_threshold,
+                "geometry_max_distance": geometry_max_distance,
+                "max_cross_cam_gap_frames": max_cross_cam_gap_frames,
+            }
+        self.assoc_cfg = CrossCameraAssociationConfig.from_yaml(association_config)
+        self.zone_map = None
+        if self.assoc_cfg.zones_path:
+            zones_path = Path(self.assoc_cfg.zones_path)
+            if not zones_path.is_file():
+                raise FileNotFoundError(f"zones_path not found: {zones_path}")
+            self.zone_map = ZoneMap.from_yaml(zones_path)
+        self._local_zones = LocalZoneTracker(self.zone_map)
+        self.association_cost_threshold = self.assoc_cfg.reid_cost_threshold
         self.association_reid_weight = float(np.clip(association_reid_weight, 0.0, 1.0))
-        # Normalization scale of the geometry cost (in homography world units,
-        # usually meters): geometry_cost = min(dist / geometry_max_distance, 1).
-        self.geometry_max_distance = float(geometry_max_distance)
-        self.max_cross_cam_gap_frames = int(max_cross_cam_gap_frames)
+        self.geometry_max_distance = self.assoc_cfg.geometry_max_distance_m
+        self.max_cross_cam_gap_frames = self.assoc_cfg.max_cross_cam_gap_frames
         self.mapping_clear_after_lost_frames = int(
             mapping_clear_after_lost_frames
             if mapping_clear_after_lost_frames is not None
             else max_history_gap_frames
         )
+        self.use_temporal_decay = bool(use_temporal_decay)
 
-        # global_id -> {local_appearance, cam_world, cam_last_frame,
-        #               active_cameras, last_seen_cam, last_seen_world}
+        # global_id -> GlobalTrack with per-frame multicamera history.
         self.global_tracks = {}
+        self._global_track_store = GlobalTrackStore(self.global_tracks)
         self._next_global_id = 1
         # (cam_index, local_track_id) -> global_id
         self.local_to_global = {}
@@ -603,6 +629,8 @@ class MultiCameraTrackingPipeline:
                 self.shared_reid_model,
                 frames,
                 detections_per_cam,
+                max_batch_size=self.reid_batch_size,
+                conf_thresh=self.reid_accum_conf_thresh,
             )
             self._last_batch_reid_ms = (time.perf_counter() - t_reid0) * 1000.0
 
@@ -638,111 +666,104 @@ class MultiCameraTrackingPipeline:
         return None
 
     def _geo_cost(self, a, b):
-        """Normalized distance in world coordinates, [0, 1]."""
+        """Normalized haversine distance in world GPS coordinates, [0, 1]."""
         if a is None or b is None:
             return None
-        d = float(np.hypot(a[0] - b[0], a[1] - b[1]))
-        if self.geometry_max_distance <= 0:
+        d = world_gps_distance_m(a, b)
+        if self.assoc_cfg.geometry_max_distance_m <= 0:
             return 0.0
-        return min(d / self.geometry_max_distance, 1.0)
+        return min(d / self.assoc_cfg.geometry_max_distance_m, 1.0)
 
     @staticmethod
-    def _global_last_frame(meta: dict) -> int | None:
-        cam_last = meta.get("cam_last_frame") or {}
-        if not cam_last:
-            return None
-        return max(cam_last.values())
+    def _global_last_frame(track) -> int | None:
+        return track.last_frame
 
-    def _geometry_cost_for_match(self, query_cam: int, query_wpt, gmeta: dict):
-        """Min geo cost to other active cameras; fallback to last_seen_cam."""
-        if query_wpt is None:
+    def _geometry_cost_for_match(self, query_cam: int, query_wpt, gmeta):
+        """Min overlap GPS distance cost to other active cameras."""
+        dist_m = min_overlap_distance_m(query_wpt, gmeta, query_cam)
+        if dist_m is None:
             return None
+        if self.assoc_cfg.geometry_max_distance_m <= 0:
+            return 0.0
+        return min(dist_m / self.assoc_cfg.geometry_max_distance_m, 1.0)
 
-        active = gmeta.get("active_cameras") or set()
-        cam_world = gmeta.get("cam_world") or {}
-        refs = [
-            cam_world[c]
-            for c in active
-            if c != query_cam and c in cam_world and cam_world[c] is not None
-        ]
-        if refs:
-            return min(self._geo_cost(query_wpt, r) for r in refs)
-
-        last_cam = gmeta.get("last_seen_cam")
-        last_world = gmeta.get("last_seen_world")
-        if last_cam is None or last_cam == query_cam or last_world is None:
-            return None
-
-        cam_last = gmeta.get("cam_last_frame") or {}
-        last_f = cam_last.get(last_cam)
-        if last_f is None:
-            return None
-        if self.frame_idx - last_f > self.max_cross_cam_gap_frames:
-            return None
-        return self._geo_cost(query_wpt, last_world)
-
-    def _assoc_cost(self, fvec, gid, query_cam, wpt):
-        """Combined cost: lambda * ReID + (1 - lambda) * geometry."""
+    def _assoc_cost(self, fvec, gid, query_cam, wpt, query_bbox=None, query_local_tid=None):
+        """Association cost after hard gates and soft penalties."""
         gmeta = self.global_tracks[gid]
-        reid = None
-        if fvec is not None:
-            reid = cross_camera_appearance_distance(
-                fvec,
-                gmeta.get("local_appearance", {}),
-                query_cam,
-                gmeta.get("active_cameras") or set(),
-                gmeta.get("last_seen_cam"),
-                mode=self.appearance_update,
-                cam_last_frame=gmeta.get("cam_last_frame"),
-                frame_idx=self.frame_idx,
-                max_gap_frames=self.max_cross_cam_gap_frames,
-            )
-        geo = self._geometry_cost_for_match(query_cam, wpt, gmeta)
-        lam = self.association_reid_weight
-        if reid is not None and geo is not None:
-            return lam * reid + (1.0 - lam) * geo
-        if reid is not None:
-            return reid
-        if geo is not None:
-            return geo
-        return None
+        zone_cam = int(self.cam_ids[query_cam])
+        query_zone_entry = (
+            self._local_zones.entry_zone((query_cam, query_local_tid))
+            if query_local_tid is not None
+            else None
+        )
+        return association_cost_for_match(
+            self.assoc_cfg,
+            query_cam,
+            wpt,
+            fvec,
+            gmeta,
+            self.frame_idx,
+            appearance_update=self.appearance_update,
+            query_bbox=query_bbox,
+            zone_map=self.zone_map,
+            zone_cam=zone_cam,
+            query_zone_entry=query_zone_entry,
+        )
 
-    def _update_local_state(self, gid, cam_id, local_tid, raw_feat, wpt):
+    def _make_global_observation(self, row, local_tid, raw_feat, wpt) -> CamObservation:
+        x1, y1, x2, y2 = map(float, row[:4])
+        conf = float(row[5]) if len(row) > 5 else 0.0
+        has_detection = int(row[7]) if len(row) > 7 else 1
+        return CamObservation(
+            local_tid=int(local_tid),
+            bbox=(x1, y1, x2, y2),
+            wpt=wpt,
+            reid_raw=raw_feat,
+            conf=conf,
+            has_detection=has_detection,
+        )
+
+    def _update_local_state(self, gid, cam_id, local_tid, raw_feat, wpt, row=None):
         """Update appearance and per-camera world point for one local track."""
-        g = self.global_tracks[gid]
-        if raw_feat is not None:
-            g.setdefault("local_appearance", {})[(cam_id, int(local_tid))] = np.asarray(
-                raw_feat, dtype=np.float32
-            ).copy()
-        if wpt is not None:
-            g.setdefault("cam_world", {})[cam_id] = (float(wpt[0]), float(wpt[1]))
-            g.setdefault("cam_last_frame", {})[cam_id] = self.frame_idx
+        if row is None:
+            bbox = None
+            conf = 0.0
+            has_detection = 1
+        else:
+            bbox = tuple(float(v) for v in row[:4])
+            conf = float(row[5]) if len(row) > 5 else 0.0
+            has_detection = int(row[7]) if len(row) > 7 else 1
+        obs = CamObservation(
+            local_tid=int(local_tid),
+            bbox=bbox,
+            wpt=wpt,
+            reid_raw=raw_feat,
+            conf=conf,
+            has_detection=has_detection,
+        )
+        self._global_track_store.append_observation(gid, self.frame_idx, cam_id, obs)
 
     def _refresh_active_cameras(self, per_cam_tracks):
         """Recompute active_cameras per global id; update last_seen on deactivation."""
-        active_local: dict[int, set[int]] = {}
-        for cam_id, tracks in enumerate(per_cam_tracks):
+        self._global_track_store.refresh_active(
+            self.local_to_global,
+            per_cam_tracks,
+            zone_map=getattr(self, "zone_map", None),
+            cam_ids=getattr(self, "cam_ids", None),
+            local_zone_tracker=getattr(self, "_local_zones", None),
+        )
+
+    def _update_local_zone_states(self, per_cam_tracks):
+        if self.zone_map is None or self.zone_map.mode != "tracklet":
+            return
+        for cam_idx, tracks in enumerate(per_cam_tracks):
             if tracks is None or len(tracks) == 0:
-                active_local[cam_id] = set()
                 continue
-            active_local[cam_id] = {int(row[4]) for row in tracks}
-
-        gid_to_cams: dict[int, set[int]] = {}
-        for (cam_id, local_tid), gid in self.local_to_global.items():
-            if local_tid in active_local.get(cam_id, set()):
-                gid_to_cams.setdefault(gid, set()).add(cam_id)
-
-        for gid, gmeta in self.global_tracks.items():
-            prev_active = set(gmeta.get("active_cameras") or set())
-            new_active = gid_to_cams.get(gid, set())
-            dropped = prev_active - new_active
-            if dropped:
-                last_cam = max(dropped, key=lambda c: gmeta.get("cam_last_frame", {}).get(c, -1))
-                gmeta["last_seen_cam"] = last_cam
-                cam_world = gmeta.get("cam_world") or {}
-                if last_cam in cam_world:
-                    gmeta["last_seen_world"] = cam_world[last_cam]
-            gmeta["active_cameras"] = new_active
+            real_cam = int(self.cam_ids[cam_idx])
+            for row in tracks:
+                local_tid = int(row[4])
+                bbox = tuple(float(v) for v in row[:4])
+                self._local_zones.update((cam_idx, local_tid), real_cam, bbox)
 
     def _valid_candidates(self, query_cam, candidates):
         """Filter global-id candidates (velocity, cam graph, etc.). Stub in v1."""
@@ -752,7 +773,9 @@ class MultiCameraTrackingPipeline:
         """Global hypotheses not active on query_cam and not too old."""
         out = []
         for gid, meta in self.global_tracks.items():
-            if cam_id in (meta.get("active_cameras") or set()):
+            if meta.state == "lost":
+                continue
+            if cam_id in (meta.active_cameras or set()):
                 continue
             last_f = self._global_last_frame(meta)
             if last_f is None:
@@ -792,6 +815,7 @@ class MultiCameraTrackingPipeline:
                             match_map.get(local_tid),
                             raw_map.get(local_tid),
                             wpt,
+                            row,
                         )
                         gid = self.local_to_global[key]
                     taken.add(gid)
@@ -802,11 +826,12 @@ class MultiCameraTrackingPipeline:
                         local_tid,
                         raw_map.get(local_tid),
                         wpt,
+                        row,
                     )
                     continue
                 match_map, raw_map = self._cam_appearance_maps(cam_id)
                 fvec = match_map.get(local_tid)
-                unmatched.append((cam_id, local_tid, fvec, raw_map.get(local_tid), wpt))
+                unmatched.append((cam_id, local_tid, fvec, raw_map.get(local_tid), wpt, row))
 
         if not unmatched:
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
@@ -814,24 +839,32 @@ class MultiCameraTrackingPipeline:
             return
 
         raw_candidates = self._candidate_globals_for_unmatched(
-            {c for c, _, _, _, _ in unmatched}
+            {c for c, _, _, _, _, _ in unmatched}
         )
         if not raw_candidates:
-            for cam_id, local_tid, fvec, raw_feat, wpt in unmatched:
-                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
+            for cam_id, local_tid, fvec, raw_feat, wpt, row in unmatched:
+                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt, row)
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
             self._refresh_active_cameras(per_cam_tracks)
             return
 
         n_u = len(unmatched)
         col_entries: dict[int, list[tuple[int, int]]] = {}
-        for i, (cam_id, local_tid, fvec, _raw_feat, wpt) in enumerate(unmatched):
+        for i, (cam_id, local_tid, fvec, _raw_feat, wpt, row) in enumerate(unmatched):
             cam_taken = taken_per_cam.get(cam_id, set())
             candidates = self._valid_candidates(cam_id, raw_candidates)
+            query_bbox = tuple(float(v) for v in row[:4]) if row is not None else None
             for gid in candidates:
                 if gid in cam_taken:
                     continue
-                cost = self._assoc_cost(fvec, gid, cam_id, wpt)
+                cost = self._assoc_cost(
+                    fvec,
+                    gid,
+                    cam_id,
+                    wpt,
+                    query_bbox,
+                    query_local_tid=local_tid,
+                )
                 if cost is None:
                     continue
                 col_entries.setdefault(gid, []).append((i, cost))
@@ -839,8 +872,8 @@ class MultiCameraTrackingPipeline:
         col_gid = sorted(col_entries.keys())
         n_g = len(col_gid)
         if n_g == 0:
-            for cam_id, local_tid, fvec, raw_feat, wpt in unmatched:
-                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
+            for cam_id, local_tid, fvec, raw_feat, wpt, row in unmatched:
+                self._new_global(cam_id, local_tid, fvec, raw_feat, wpt, row)
             self._resolve_per_cam_gid_conflicts(per_cam_tracks)
             self._refresh_active_cameras(per_cam_tracks)
             return
@@ -862,9 +895,9 @@ class MultiCameraTrackingPipeline:
                 continue
             if P[r, c] >= COST_INF / 2:
                 continue
-            if P[r, c] > self.association_cost_threshold:
+            if P[r, c] > self.assoc_cfg.reid_cost_threshold:
                 continue
-            cam_id, local_tid, fvec, raw_feat, wpt = unmatched[r]
+            cam_id, local_tid, fvec, raw_feat, wpt, row = unmatched[r]
             gid = col_gid[c]
             if gid in taken_per_cam.get(cam_id, set()):
                 continue
@@ -872,12 +905,12 @@ class MultiCameraTrackingPipeline:
             taken_per_cam.setdefault(cam_id, set()).add(gid)
             used_local.add(r)
             used_global.add(c)
-            self._update_local_state(gid, cam_id, local_tid, raw_feat, wpt)
+            self._update_local_state(gid, cam_id, local_tid, raw_feat, wpt, row)
 
-        for i, (cam_id, local_tid, fvec, raw_feat, wpt) in enumerate(unmatched):
+        for i, (cam_id, local_tid, fvec, raw_feat, wpt, row) in enumerate(unmatched):
             if i in used_local:
                 continue
-            self._new_global(cam_id, local_tid, fvec, raw_feat, wpt)
+            self._new_global(cam_id, local_tid, fvec, raw_feat, wpt, row)
 
         self._resolve_per_cam_gid_conflicts(per_cam_tracks)
         self._refresh_active_cameras(per_cam_tracks)
@@ -913,6 +946,7 @@ class MultiCameraTrackingPipeline:
                         match_map.get(local_tid),
                         raw_map.get(local_tid),
                         wpt,
+                        row,
                     )
 
     def _candidate_globals_for_unmatched(self, cam_ids):
@@ -923,40 +957,33 @@ class MultiCameraTrackingPipeline:
                 seen.add(gid)
         return sorted(seen)
 
-    def _new_global(self, cam_id, local_tid, fvec, raw_feat=None, wpt=None):
+    def _new_global(self, cam_id, local_tid, fvec, raw_feat=None, wpt=None, row=None):
         gid = self._next_global_id
         self._next_global_id += 1
         key = (cam_id, local_tid)
         self.local_to_global[key] = gid
         self._local_absent_frames.pop(key, None)
-        stored = None
-        if raw_feat is not None:
-            stored = np.asarray(raw_feat, dtype=np.float32).copy()
-        elif fvec is not None:
-            stored = np.asarray(fvec, dtype=np.float32).copy()
-        local_appearance = {}
-        if stored is not None:
-            local_appearance[key] = stored
-        cam_world = {}
-        cam_last_frame = {}
-        if wpt is not None:
-            cam_world[cam_id] = (float(wpt[0]), float(wpt[1]))
-            cam_last_frame[cam_id] = self.frame_idx
-        self.global_tracks[gid] = {
-            "local_appearance": local_appearance,
-            "cam_world": cam_world,
-            "cam_last_frame": cam_last_frame,
-            "active_cameras": {cam_id},
-            "last_seen_cam": None,
-            "last_seen_world": None,
-        }
+        stored = raw_feat if raw_feat is not None else fvec
+        if row is None:
+            obs = CamObservation(
+                local_tid=int(local_tid),
+                bbox=None,
+                wpt=wpt,
+                reid_raw=stored,
+                conf=0.0,
+                has_detection=1,
+            )
+        else:
+            obs = self._make_global_observation(row, local_tid, stored, wpt)
+        self._global_track_store.create(gid, self.frame_idx, cam_id, obs)
 
     def _clear_local_mapping(self, key: tuple[int, int]) -> None:
         gid = self.local_to_global.get(key)
         self.local_to_global.pop(key, None)
         self._local_absent_frames.pop(key, None)
+        self._local_zones.pop(key)
         if gid is not None and gid in self.global_tracks:
-            self.global_tracks[gid].get("local_appearance", {}).pop(key, None)
+            self._global_track_store.remove_local_appearance_key(gid, key[0], key[1])
 
     def _prune_stale_local_mappings(self, per_cam_tracks):
         """Drop (cam, local_tid)->gid mappings based on the SCT track state.
@@ -1004,6 +1031,25 @@ class MultiCameraTrackingPipeline:
     def global_id_for(self, cam_id, local_tid):
         return self.local_to_global.get((cam_id, int(local_tid)))
 
+    def _finalize_global_tracks_frame(self, per_cam_tracks) -> None:
+        deleted = self._global_track_store.finalize_frame(
+            self.frame_idx,
+            per_cam_tracks,
+            self.local_to_global,
+            lost_after=self.mapping_clear_after_lost_frames,
+            delete_after=self.max_cross_cam_gap_frames,
+            zone_map=self.zone_map,
+            cam_ids=self.cam_ids,
+            local_zone_tracker=self._local_zones,
+        )
+        if deleted:
+            deleted_set = set(deleted)
+            for key, gid in list(self.local_to_global.items()):
+                if gid in deleted_set:
+                    self.local_to_global.pop(key, None)
+                    self._local_absent_frames.pop(key, None)
+                    self._local_zones.pop(key)
+
     def run(
         self,
         visualize=True,
@@ -1037,8 +1083,10 @@ class MultiCameraTrackingPipeline:
 
                 per_cam_tracks = self._step_sct(frames)
                 t_after_sct = time.perf_counter()
+                self._update_local_zone_states(per_cam_tracks)
                 self._prune_stale_local_mappings(per_cam_tracks)
                 self._associate_cross_camera(per_cam_tracks)
+                self._finalize_global_tracks_frame(per_cam_tracks)
                 t_after_mcmt = time.perf_counter()
 
                 if self.mcmt_writer is not None:

@@ -7,6 +7,7 @@ import yaml
 from core.io.calibration import load_homography_image_to_world
 from core.io.mot_detections import resolve_cityflow_det_paths
 from core.io.roi import resolve_roi_paths
+from core.mot.association.cross_camera import CrossCameraAssociationConfig
 from pipeline import MultiCameraTrackingPipeline
 from pipeline import SingleCameraTrackerPipeline
 
@@ -194,6 +195,7 @@ def run_from_config(config):
             raise ValueError("multi_camera.sources is empty in config")
 
         detection_files = _maybe_detection_files(sources, detector_cfg)
+        association_cfg = CrossCameraAssociationConfig.from_yaml(multi_cfg)
 
         pipeline = MultiCameraTrackingPipeline(
             sources=sources,
@@ -220,11 +222,13 @@ def run_from_config(config):
             mapping_clear_after_lost_frames=multi_cfg.get(
                 "mapping_clear_after_lost_frames"
             ),
+            use_temporal_decay=bool(multi_cfg.get("use_temporal_decay", False)),
             cam_ids=multi_cfg.get("cam_ids"),
             results_dir=multi_cfg.get("results_dir"),
             roi_paths=_maybe_roi_paths(sources, multi_cfg.get("roi")),
             detection_files=detection_files,
             video_fps=float(output_cfg.get("video_fps", 10)),
+            association_config=association_cfg,
         )
         pipeline.run(
             visualize=visualize,

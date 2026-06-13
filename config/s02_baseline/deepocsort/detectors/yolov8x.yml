@@ -35,7 +35,7 @@ multi_camera:
   roi: auto
   association_cost_threshold: 0.25
   association_reid_weight: 0.5
-  geometry_max_distance: 25.0
+  geometry_max_distance: 8.0
   max_cross_cam_gap_frames: 300
   max_history_gap_frames: 30
   results_dir: outputs/s02_baseline/deepocsort/detectors/yolov8x

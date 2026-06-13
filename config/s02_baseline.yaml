@@ -17,7 +17,7 @@ detector:
   model: models/yolov8m.pt
   # COCO: 2=car, 3=motorbike, 5=bus, 7=truck. CityFlow tracks vehicles only.
   target_classes: [2, 3, 5, 7]
-  conf_thres: 0.6
+  conf_thres: 0.2
   imgsz: 640
   device: 0
 
@@ -27,7 +27,7 @@ tracker:
   reid_weights: models/osnet_ibn_x1_0_msmt17.pt
   device: 0
   half: false
-  det_thresh: 0.6
+  det_thresh: 0.3
   max_age: 30
   min_hits: 5
   iou_threshold: 0.3

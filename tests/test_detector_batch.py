@@ -53,6 +53,7 @@ class TestDetectorBatch(unittest.TestCase):
             det = Detector()
             det.conf_thres = 0.5
             det.target_classes = [2, 3, 5, 7]
+            det.imgsz = 960
             det.model = MagicMock(return_value=mock_results)
 
             out = det.detect_batch(frames)
@@ -97,11 +98,15 @@ class TestSharedDetectorWiring(unittest.TestCase):
 
         p = object.__new__(MultiCameraTrackingPipeline)
         p.shared_detector = shared
-        p._batch_inference_enabled = True
+        p.shared_reid_model = None
+        p._last_batch_reid_ms = None
+        p.frame_idx = 0
         p.per_cam_pipelines = [
             MagicMock(),
             MagicMock(),
         ]
+        for cam in p.per_cam_pipelines:
+            cam._filter_detections_roi.side_effect = lambda dets: dets
         p.per_cam_pipelines[0].process_frame.return_value = np.empty(
             (0, 8), dtype=np.float32
         )
@@ -116,21 +121,6 @@ class TestSharedDetectorWiring(unittest.TestCase):
         self.assertEqual(len(tracks), 2)
         p.per_cam_pipelines[0].process_frame.assert_called_once()
         p.per_cam_pipelines[1].process_frame.assert_called_once()
-
-    def test_batch_failure_falls_back_to_sequential(self):
-        shared = MagicMock()
-        shared.detect_batch.side_effect = RuntimeError("OOM")
-
-        p = object.__new__(MultiCameraTrackingPipeline)
-        p.shared_detector = shared
-        p._batch_inference_enabled = True
-        p._step_sct_sequential = MagicMock(return_value=["sequential"])
-
-        out = p._step_sct([np.zeros((8, 8, 3), dtype=np.uint8)])
-
-        p._step_sct_sequential.assert_called_once()
-        self.assertEqual(out, ["sequential"])
-
 
 if __name__ == "__main__":
     unittest.main()
