@@ -13,7 +13,9 @@ The inverse may be cached as ``calibration_i2w.txt`` (same format) next to
 """
 from __future__ import annotations
 
+import json
 import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Union
 
@@ -162,3 +164,72 @@ def world_gps_distance_m(
 ) -> float:
     """Distance between two ``(xworld, yworld)`` = ``(lat, lon)`` points."""
     return haversine_distance_m(a[0], a[1], b[0], b[1])
+
+
+def world_plane_distance(
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> float:
+    """Euclidean distance in an arbitrary ground-plane coordinate system."""
+    return float(math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1])))
+
+
+def world_distance(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    *,
+    metric: str = "gps",
+) -> float:
+    if metric == "plane":
+        return world_plane_distance(a, b)
+    if metric == "gps":
+        return world_gps_distance_m(a, b)
+    raise ValueError(f"Unknown world distance metric: {metric!r}")
+
+
+@dataclass(frozen=True)
+class CalibPointPair:
+    image_x: float
+    image_y: float
+    world_x: float
+    world_y: float
+
+
+def calibration_points_path(calibration_path: Union[str, Path]) -> Path:
+    return Path(calibration_path).parent / "calibration_points.json"
+
+
+def save_calibration_points(
+    calibration_path: Union[str, Path],
+    *,
+    image_path: Union[str, Path],
+    pairs: list[CalibPointPair],
+    reprojection_error: float | None = None,
+) -> Path:
+    out = calibration_points_path(calibration_path)
+    payload = {
+        "image": str(Path(image_path).name),
+        "reprojection_error": reprojection_error,
+        "pairs": [asdict(p) for p in pairs],
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out
+
+
+def load_calibration_points(
+    calibration_path: Union[str, Path],
+) -> tuple[str | None, list[CalibPointPair], float | None]:
+    path = calibration_points_path(calibration_path)
+    if not path.is_file():
+        return None, [], None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pairs = [
+        CalibPointPair(
+            image_x=float(p["image_x"]),
+            image_y=float(p["image_y"]),
+            world_x=float(p["world_x"]),
+            world_y=float(p["world_y"]),
+        )
+        for p in payload.get("pairs", [])
+    ]
+    return payload.get("image"), pairs, payload.get("reprojection_error")

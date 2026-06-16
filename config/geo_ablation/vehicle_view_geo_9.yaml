@@ -4,7 +4,7 @@
 run_mode: multi_camera
 
 detector:
-  model: models/yolov8m.pt
+  model: models/yolo26l.pt
   target_classes: [2, 3, 5, 7]
   conf_thres: 0.4
   device: 0

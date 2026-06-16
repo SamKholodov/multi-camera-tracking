@@ -27,11 +27,10 @@ _BoxmotBotSort = _import_boxmot_botsort()
 class BotSortTracker:
     def __init__(
         self,
-        reid_weights=r"models/osnet_ibn_x1_0_msmt17.pt",
-        device=0,
-        half=False,
+        reid_model=None,
         use_default_reid=True,
         custom_reid_extractor=None,
+        **tracker_kwargs,
     ):
         self.use_default_reid = bool(use_default_reid)
         self.custom_reid_extractor = custom_reid_extractor
@@ -46,6 +45,7 @@ class BotSortTracker:
             appearance_thresh=0.35,
             with_reid=self.use_default_reid,
         )
+        common.update(tracker_kwargs)
 
         if _BoxmotBotSort is None:
             raise ImportError(
@@ -53,26 +53,15 @@ class BotSortTracker:
                 "Or switch tracker.type to 'deepocsort' in your YAML (no boxmot needed)."
             )
 
-        # boxmot >= 19: reid_model=...; older: reid_weights + device + half
-        try:
-            if self.use_default_reid:
-                self.tracker = _BoxmotBotSort(
-                    reid_weights=reid_weights,
-                    device=device,
-                    half=half,
-                    **common,
+        if self.use_default_reid:
+            if reid_model is None:
+                raise ValueError(
+                    "BotSort with use_default_reid=true requires a ReID model. "
+                    "Set tracker.reid_weights or use_default_reid: false."
                 )
-            else:
-                self.tracker = _BoxmotBotSort(**common)
-        except TypeError:
-            common.pop("with_reid", None)
-            if self.use_default_reid:
-                self.tracker = _BoxmotBotSort(
-                    reid_model=reid_weights,
-                    **common,
-                )
-            else:
-                self.tracker = _BoxmotBotSort(with_reid=False, **common)
+            self.tracker = _BoxmotBotSort(reid_model=reid_model, **common)
+        else:
+            self.tracker = _BoxmotBotSort(**common)
 
     @staticmethod
     def _normalize_embeddings(features, expected_count):

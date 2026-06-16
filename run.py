@@ -6,7 +6,7 @@ import yaml
 
 from core.io.calibration import load_homography_image_to_world
 from core.io.mot_detections import resolve_cityflow_det_paths
-from core.io.roi import resolve_roi_paths
+from core.io.roi import resolve_roi_paths, roi_path_for_source
 from core.mot.association.cross_camera import CrossCameraAssociationConfig
 from pipeline import MultiCameraTrackingPipeline
 from pipeline import SingleCameraTrackerPipeline
@@ -80,10 +80,9 @@ def _maybe_roi_paths(sources, roi_cfg):
         return None
     if isinstance(roi_cfg, str) and roi_cfg.lower() == "auto":
         return [
-            str(Path(src).parent / "roi.jpg")
-            if (Path(src).parent / "roi.jpg").exists()
-            else None
+            str(path) if path.exists() else None
             for src in sources
+            for path in [roi_path_for_source(src)]
         ]
     if isinstance(roi_cfg, str):
         if len(sources) != 1:
@@ -196,6 +195,9 @@ def run_from_config(config):
 
         detection_files = _maybe_detection_files(sources, detector_cfg)
         association_cfg = CrossCameraAssociationConfig.from_yaml(multi_cfg)
+        max_frames = multi_cfg.get("max_frames")
+        if max_frames is not None:
+            max_frames = int(max_frames)
 
         pipeline = MultiCameraTrackingPipeline(
             sources=sources,
@@ -229,6 +231,7 @@ def run_from_config(config):
             detection_files=detection_files,
             video_fps=float(output_cfg.get("video_fps", 10)),
             association_config=association_cfg,
+            max_frames=max_frames,
         )
         pipeline.run(
             visualize=visualize,

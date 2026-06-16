@@ -5,7 +5,7 @@
 run_mode: single_camera
 
 detector:
-  model: models/yolov8m.pt
+  model: models/yolo26l.pt
   # Список классов COCO: каждый номер отдельной строкой или одна строка [2, 3, 5, 7].
   # Неверно: "- 2, 3, 5, 7" — YAML даст одну строку, YOLO упадёт в NMS.
   target_classes: [2, 3, 5, 7]

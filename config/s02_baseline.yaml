@@ -14,7 +14,7 @@
 run_mode: multi_camera
 
 detector:
-  model: models/yolov8m.pt
+  model: models/yolo26l.pt
   # COCO: 2=car, 3=motorbike, 5=bus, 7=truck. CityFlow tracks vehicles only.
   target_classes: [2, 3, 5, 7]
   conf_thres: 0.2

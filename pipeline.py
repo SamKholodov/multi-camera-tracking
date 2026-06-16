@@ -8,7 +8,7 @@ import yaml
 from scipy.optimize import linear_sum_assignment
 
 from core.detector.detector import Detector
-from core.io.calibration import project_bbox_bottom_center, world_gps_distance_m
+from core.io.calibration import project_bbox_bottom_center, world_distance
 from core.io.camera_manager import CameraManager
 from core.mot.types import (
     TRACK_NCOLS,
@@ -54,14 +54,18 @@ def _build_reid_backend(reid_weights, device, half, *, preprocess_name=None):
 
 
 def _maybe_build_shared_reid_model(tracker_config, *, share_reid_model=True):
-    """Build one shared ReID backend for multi-camera DeepOcSort."""
+    """Build one shared ReID backend for multi-camera trackers that use ReID."""
     if not share_reid_model:
         return None
     cfg = dict(tracker_config or {})
     tracker_type = str(cfg.get("type", "botsort")).lower().strip()
-    if tracker_type not in ("deepocsort", "deep_ocsort"):
-        return None
-    if not bool(cfg.get("use_embeddings", False)):
+    if tracker_type in ("deepocsort", "deep_ocsort"):
+        if not bool(cfg.get("use_embeddings", False)):
+            return None
+    elif tracker_type == "botsort":
+        if not bool(cfg.get("use_default_reid", True)):
+            return None
+    else:
         return None
     return _build_reid_backend(
         cfg.get("reid_weights"),
@@ -117,6 +121,33 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
         for k in (*reid_keys, *appearance_keys):
             cfg.pop(k, None)
         return SortTracker(**cfg)
+    if tracker_type == "botsort":
+        use_default_reid = bool(cfg.pop("use_default_reid", True))
+        reid_weights = cfg.pop("reid_weights", "models/osnet_ibn_x1_0_msmt17.pt")
+        device = cfg.pop("device", 0)
+        half = bool(cfg.pop("half", False))
+        custom_reid_extractor = cfg.pop("custom_reid_extractor", None)
+        for k in ("use_embeddings", "reid_preprocess", "share_reid_model", "batch_reid"):
+            cfg.pop(k, None)
+        for k in appearance_keys:
+            cfg.pop(k, None)
+        reid_model = None
+        if use_default_reid:
+            if shared_reid_model is not None:
+                reid_model = shared_reid_model
+            else:
+                reid_model = _build_reid_backend(
+                    reid_weights,
+                    device,
+                    half,
+                    preprocess_name=tracker_config.get("reid_preprocess"),
+                )
+        return BotSortTracker(
+            reid_model=reid_model,
+            use_default_reid=use_default_reid,
+            custom_reid_extractor=custom_reid_extractor,
+            **cfg,
+        )
     for k in (*reid_keys, *appearance_keys):
         cfg.pop(k, None)
     return BotSortTracker(**cfg)
@@ -427,9 +458,11 @@ class MultiCameraTrackingPipeline:
         video_fps=10.0,
         share_reid_model=True,
         association_config=None,
+        max_frames: int | None = None,
     ):
         self.sources = list(sources)
         self.video_fps = float(video_fps)
+        self.max_frames = int(max_frames) if max_frames is not None else None
         self.camera_manager = CameraManager(
             sources=self.sources, default_fps=self.video_fps
         )
@@ -666,10 +699,10 @@ class MultiCameraTrackingPipeline:
         return None
 
     def _geo_cost(self, a, b):
-        """Normalized haversine distance in world GPS coordinates, [0, 1]."""
+        """Normalized world distance, [0, 1]."""
         if a is None or b is None:
             return None
-        d = world_gps_distance_m(a, b)
+        d = world_distance(a, b, metric=self.assoc_cfg.geometry_distance_metric)
         if self.assoc_cfg.geometry_max_distance_m <= 0:
             return 0.0
         return min(d / self.assoc_cfg.geometry_max_distance_m, 1.0)
@@ -680,7 +713,12 @@ class MultiCameraTrackingPipeline:
 
     def _geometry_cost_for_match(self, query_cam: int, query_wpt, gmeta):
         """Min overlap GPS distance cost to other active cameras."""
-        dist_m = min_overlap_distance_m(query_wpt, gmeta, query_cam)
+        dist_m = min_overlap_distance_m(
+            query_wpt,
+            gmeta,
+            query_cam,
+            metric=self.assoc_cfg.geometry_distance_metric,
+        )
         if dist_m is None:
             return None
         if self.assoc_cfg.geometry_max_distance_m <= 0:
@@ -1148,6 +1186,8 @@ class MultiCameraTrackingPipeline:
                     )
 
                 self.frame_idx += 1
+                if self.max_frames is not None and self.frame_idx >= self.max_frames:
+                    break
                 fps.end_frame(
                     t_frame,
                     t_after_sct,

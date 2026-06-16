@@ -464,9 +464,15 @@ class DeepOcSort(BaseTracker):
 
             iou_left = self.asso_func(left_dets, left_trks)
             # TODO: is better without this
-            emb_cost_left = left_dets_embs @ left_trks_embs.T
-            if self.embedding_off:
-                emb_cost_left = np.zeros_like(emb_cost_left)
+            if (
+                self.embedding_off
+                or not use_embedding
+                or left_dets_embs.shape[1] == 0
+                or left_trks_embs.shape[1] == 0
+            ):
+                emb_cost_left = np.zeros((left_dets.shape[0], left_trks.shape[0]))
+            else:
+                emb_cost_left = left_dets_embs @ left_trks_embs.T
             iou_left = np.array(iou_left)
             if iou_left.max() > self.iou_threshold:
                 """

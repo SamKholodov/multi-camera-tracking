@@ -2,13 +2,42 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Sequence, Union
 
 import cv2
 import numpy as np
 
 PointMode = Literal["bottom_center", "center"]
 ROISpec = Union[str, Path, np.ndarray, list]
+
+
+def roi_path_for_source(source: Union[str, Path]) -> Path:
+    """Return ``roi.jpg`` path for a video file or camera directory source."""
+    path = Path(source)
+    if path.is_dir():
+        return path / "roi.jpg"
+    return path.parent / "roi.jpg"
+
+
+def build_roi_mask_from_exclusions(
+    width: int,
+    height: int,
+    exclusion_polygons: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Build CityFlow-style mask: white = inside ROI, black = excluded zones."""
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    for poly in exclusion_polygons:
+        pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(mask, [pts], 0)
+    return mask
+
+
+def write_roi_mask(path: Union[str, Path], mask: np.ndarray) -> Path:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(out), mask):
+        raise OSError(f"Could not write ROI mask: {out}")
+    return out
 
 
 def load_roi_mask(path: Union[str, Path]) -> np.ndarray:
@@ -42,7 +71,7 @@ def resolve_roi_paths(
         if i < len(roi_paths) and roi_paths[i] is not None:
             resolved.append(roi_paths[i])
         else:
-            candidate = Path(src).parent / "roi.jpg"
+            candidate = roi_path_for_source(src)
             resolved.append(str(candidate) if candidate.exists() else None)
     return resolved
 

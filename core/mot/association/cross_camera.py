@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from core.io.calibration import world_gps_distance_m
+from core.io.calibration import world_distance
 from core.mot.appearance import cross_camera_appearance_distance
 
 
@@ -17,6 +17,7 @@ class CrossCameraAssociationConfig:
     zone_transition: bool = False
     reid_matching: bool = True
     geometry_max_distance_m: float = 8.0
+    geometry_distance_metric: str = "gps"
     max_cross_cam_gap_frames: int = 300
     reid_cost_threshold: float = 0.25
     geometry_far_penalty: float = 10.0
@@ -61,6 +62,9 @@ class CrossCameraAssociationConfig:
             zone_transition=bool(gates.get("zone_transition", False)),
             reid_matching=bool(assoc.get("reid_matching", True)),
             geometry_max_distance_m=float(geometry_max_distance_m),
+            geometry_distance_metric=str(
+                assoc.get("geometry_distance_metric", "gps")
+            ).lower().strip(),
             max_cross_cam_gap_frames=int(max_cross_cam_gap_frames),
             reid_cost_threshold=float(reid_cost_threshold),
             geometry_far_penalty=float(assoc.get("geometry_far_penalty", 10.0)),
@@ -93,7 +97,13 @@ def classify_scenario(active_cameras, query_cam: int) -> str:
     return "overlap" if other_active else "handoff"
 
 
-def min_overlap_distance_m(query_wpt, gmeta, query_cam: int) -> float | None:
+def min_overlap_distance_m(
+    query_wpt,
+    gmeta,
+    query_cam: int,
+    *,
+    metric: str = "gps",
+) -> float | None:
     if query_wpt is None:
         return None
     cam_world = gmeta.cam_world or {}
@@ -104,7 +114,7 @@ def min_overlap_distance_m(query_wpt, gmeta, query_cam: int) -> float | None:
     ]
     if not refs:
         return None
-    return float(min(world_gps_distance_m(query_wpt, ref) for ref in refs))
+    return float(min(world_distance(query_wpt, ref, metric=metric) for ref in refs))
 
 
 def passes_cam_transition(
@@ -246,7 +256,12 @@ def _passes_soft_as_hard(
             return False
 
     if config.geometry_overlap and scenario == "overlap":
-        dist_m = min_overlap_distance_m(query_wpt, gmeta, query_cam)
+        dist_m = min_overlap_distance_m(
+            query_wpt,
+            gmeta,
+            query_cam,
+            metric=config.geometry_distance_metric,
+        )
         if dist_m is None:
             return False
         max_m = config.geometry_max_distance_m
@@ -279,7 +294,12 @@ def geometry_penalty(
         return 1.0
     if classify_scenario(gmeta.active_cameras or set(), query_cam) != "overlap":
         return 1.0
-    dist_m = min_overlap_distance_m(query_wpt, gmeta, query_cam)
+    dist_m = min_overlap_distance_m(
+        query_wpt,
+        gmeta,
+        query_cam,
+        metric=config.geometry_distance_metric,
+    )
     if dist_m is None:
         return config.geometry_missing_penalty
     max_m = config.geometry_max_distance_m
