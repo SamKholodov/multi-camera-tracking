@@ -1,0 +1,36 @@
+# Example: supervise view only on conv3 (early features).
+# Run: python train_vehicle_reid.py --config config/reid_train/vehicle_osnet_view_conv3.yaml
+
+model: vehicle_osnet_x1_0
+resume: runs/vehicle_reid/osnet_x1_0_veri_vric_view_conv3/epoch_75.pth
+# pretrained_path: osnet_x1_0_imagenet.pth
+img_size: [128, 256]
+preprocess: pad_ratio_resize
+datasets: [veri, vric, veri_wild]
+data_dir: reid_datasets
+
+lambda_triplet: 1.0
+lambda_view: 0.2
+num_view_classes: 8
+view_layers: [conv3]
+
+p: 32
+k: 4
+fallback_p: 8
+batch_size: 256
+
+epochs: 120
+warmup_epochs: 10
+lr: 5.0e-4
+eval_interval: 5
+weight_decay: 5.0e-4
+label_smooth: 0.1
+margin: 0.3
+val_fraction: 0.1
+
+num_workers: 4
+seed: 42
+device: cuda:0
+project: runs/vehicle_reid
+name: osnet_x1_0_veri_vric_view_conv3
+log_file: osnet_training.log

@@ -15,6 +15,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from core.reid.backbones.vehicle_osnet import (
+    normalize_view_layer_weights,
+    normalize_view_layers,
+    remap_vehicle_view_state_dict,
+)
 from core.reid.core.registry import ReIDModelRegistry
 from core.reid.datasets import build_dataset
 from core.reid.datasets.base import DatasetSplit, ReIDSample
@@ -78,14 +83,18 @@ class VehicleReIDTrainer:
         img_size: Tuple[int, int] = (128, 256),
         preprocess: str = "pad_ratio_resize",
         num_view_classes: int = 8,
+        view_layers: List[str] | Tuple[str, ...] | str | None = None,
+        view_layer_weights: dict[str, float] | None = None,
         lambda_id: float = 1.0,
         lambda_triplet: float = 1.0,
         lambda_view: float = 0.2,
         checkpoint: str | None = None,
+        resume: str | None = None,
         freeze_backbone: bool = False,
         freeze_reid_heads: bool = False,
         best_metric: str = "veri_mAP",
         eval_ranking: bool = True,
+        eval_interval: int = 1,
         p: int = 16,
         k: int = 4,
         fallback_p: int = 8,
@@ -112,14 +121,21 @@ class VehicleReIDTrainer:
         self.img_size = img_size
         self.preprocess = preprocess
         self.num_view_classes = num_view_classes
+        self.view_layers = normalize_view_layers(view_layers)
+        self.view_layer_weights = normalize_view_layer_weights(
+            view_layer_weights,
+            self.view_layers,
+        )
         self.lambda_id = lambda_id
         self.lambda_triplet = lambda_triplet
         self.lambda_view = lambda_view
         self.checkpoint = checkpoint
+        self.resume = resume
         self.freeze_backbone = freeze_backbone
         self.freeze_reid_heads = freeze_reid_heads
         self.best_metric = best_metric
         self.eval_ranking = eval_ranking
+        self.eval_interval = max(int(eval_interval), 1)
         self.p = p
         self.k = k
         self.fallback_p = fallback_p
@@ -158,9 +174,11 @@ class VehicleReIDTrainer:
         eval_batch_size = self.batch_size or train_batch_size
 
         model_num_classes = num_classes
-        if self.checkpoint:
+        resume_path = Path(self.resume) if self.resume else None
+        weight_ckpt_path = resume_path or (Path(self.checkpoint) if self.checkpoint else None)
+        if weight_ckpt_path is not None:
             ckpt_meta = torch.load(
-                self.checkpoint, map_location="cpu", weights_only=False
+                weight_ckpt_path, map_location="cpu", weights_only=False
             )
             if ckpt_meta.get("num_classes") is not None:
                 model_num_classes = int(ckpt_meta["num_classes"])
@@ -171,7 +189,7 @@ class VehicleReIDTrainer:
                     )
 
         model = self._build_model(model_num_classes).to(self.device)
-        if self.checkpoint:
+        if self.checkpoint and not self.resume:
             self._load_checkpoint(model, self.checkpoint)
         self._apply_freeze(model)
 
@@ -206,7 +224,7 @@ class VehicleReIDTrainer:
         val_loss_loaders = {
             name: self._build_loss_loader(samples, eval_batch_size)
             for name, samples in val_samples_by_dataset.items()
-            if samples
+            if samples and name in self.datasets
         }
         ranking_loaders = {
             name: self._build_ranking_loaders(ds, eval_batch_size)
@@ -221,8 +239,32 @@ class VehicleReIDTrainer:
         best_path = save_dir / "best.pth"
         history: List[VehicleTrainMetrics] = []
         val_history: List[Dict[str, VehicleValMetrics]] = []
+        start_epoch = 1
 
-        for epoch in range(1, self.epochs + 1):
+        if self.resume:
+            start_epoch, best_epoch, best_score, history, val_history = (
+                self._load_resume_state(
+                    Path(self.resume),
+                    model,
+                    optimizer,
+                    scheduler,
+                    save_dir,
+                )
+            )
+            if start_epoch > self.epochs:
+                LOGGER.info(
+                    f"Checkpoint epoch {start_epoch - 1} >= target epochs "
+                    f"{self.epochs}; nothing to resume."
+                )
+                return VehicleTrainResult(
+                    best_epoch=best_epoch,
+                    best_mAP=best_score,
+                    weights_path=best_path,
+                    history=history,
+                    val_history=val_history,
+                )
+
+        for epoch in range(start_epoch, self.epochs + 1):
             train_metrics = self._train_epoch(
                 epoch,
                 model,
@@ -235,28 +277,37 @@ class VehicleReIDTrainer:
             )
             history.append(train_metrics)
 
-            epoch_vals = self._validate_all(
-                model,
-                val_loss_loaders,
-                ranking_loaders,
-                criterion_id,
-                criterion_triplet,
-                criterion_view,
-            )
-            val_history.append(epoch_vals)
-
-            epoch_score = self._selection_score(epoch_vals)
-            if epoch_score > best_score:
-                best_score = epoch_score
-                best_epoch = epoch
-                self._save_checkpoint(
-                    best_path,
+            run_full_eval = self._should_run_full_eval(epoch)
+            if run_full_eval:
+                epoch_vals = self._validate_all(
                     model,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    best_score,
-                    hparams,
+                    val_loss_loaders,
+                    ranking_loaders,
+                    criterion_id,
+                    criterion_triplet,
+                    criterion_view,
+                )
+                val_history.append(epoch_vals)
+
+                epoch_score = self._selection_score(epoch_vals)
+                if epoch_score > best_score:
+                    best_score = epoch_score
+                    best_epoch = epoch
+                    self._save_checkpoint(
+                        best_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        best_score,
+                        hparams,
+                    )
+            else:
+                epoch_vals = {}
+                val_history.append(epoch_vals)
+                LOGGER.info(
+                    f"Skipping full validation at epoch {epoch} "
+                    f"(eval_interval={self.eval_interval})"
                 )
 
             self._save_checkpoint(
@@ -278,7 +329,11 @@ class VehicleReIDTrainer:
                     best_score,
                     hparams,
                 )
-            self._write_epoch_log(train_metrics, epoch_vals)
+            self._write_epoch_log(
+                train_metrics,
+                epoch_vals,
+                skip_val=not run_full_eval,
+            )
             self._save_metrics(save_dir, history, val_history, best_epoch, best_score)
 
         return VehicleTrainResult(
@@ -350,7 +405,7 @@ class VehicleReIDTrainer:
         return p, k
 
     def _build_model(self, num_classes: int) -> nn.Module:
-        use_imagenet = self.pretrained_path and not self.checkpoint
+        use_imagenet = self.pretrained_path and not self.checkpoint and not self.resume
         return ReIDModelRegistry.build_model(
             name=self.model_name,
             weights=Path("vehicle_osnet_x1_0.pth"),
@@ -360,6 +415,7 @@ class VehicleReIDTrainer:
             use_gpu=self.device.type != "cpu",
             pretrained_path=self.pretrained_path if use_imagenet else None,
             num_view_classes=self.num_view_classes,
+            view_layers=self.view_layers,
         )
 
     def _load_checkpoint(self, model: nn.Module, path: str | Path) -> None:
@@ -367,16 +423,81 @@ class VehicleReIDTrainer:
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        self._load_model_state(model, checkpoint)
+        LOGGER.info(
+            f"Loaded checkpoint {ckpt_path} "
+            f"(epoch={checkpoint.get('epoch', '?')}, "
+            f"best={checkpoint.get('best_mAP', '?')})"
+        )
+
+    def _load_model_state(self, model: nn.Module, checkpoint: dict[str, Any]) -> None:
         state_dict = checkpoint.get("state_dict", checkpoint)
+        if hasattr(model, "view_heads"):
+            state_dict = remap_vehicle_view_state_dict(state_dict)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             LOGGER.warning(f"Checkpoint missing keys: {missing}")
         if unexpected:
             LOGGER.warning(f"Checkpoint unexpected keys: {unexpected}")
+
+    def _load_resume_state(
+        self,
+        path: Path,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.CosineAnnealingLR,
+        save_dir: Path,
+    ) -> tuple[int, int, float, list[VehicleTrainMetrics], list[dict[str, VehicleValMetrics]]]:
+        if not path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self._load_model_state(model, checkpoint)
+
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+
+        for group in optimizer.param_groups:
+            group.setdefault("_base_lr", self.lr)
+
+        completed_epoch = int(checkpoint.get("epoch", 0))
+        start_epoch = completed_epoch + 1
+        history, val_history, best_epoch, best_score = self._load_metrics_history(save_dir)
+        if best_score == float("-inf"):
+            best_score = float(checkpoint.get("best_mAP", float("-inf")))
+
         LOGGER.info(
-            f"Loaded checkpoint {ckpt_path} "
-            f"(epoch={checkpoint.get('epoch', '?')}, "
-            f"best={checkpoint.get('best_mAP', '?')})"
+            f"Resuming training from epoch {start_epoch} "
+            f"(completed epoch {completed_epoch}, best_epoch={best_epoch}, "
+            f"best_mAP={best_score:.6f})"
+        )
+        return start_epoch, best_epoch, best_score, history, val_history
+
+    @staticmethod
+    def _load_metrics_history(
+        save_dir: Path,
+    ) -> tuple[list[VehicleTrainMetrics], list[dict[str, VehicleValMetrics]], int, float]:
+        metrics_path = save_dir / "metrics.json"
+        if not metrics_path.is_file():
+            return [], [], 0, float("-inf")
+
+        data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        history = [VehicleTrainMetrics(**entry) for entry in data.get("train", [])]
+        val_history: list[dict[str, VehicleValMetrics]] = []
+        for epoch_vals in data.get("val", []):
+            val_history.append(
+                {
+                    name: VehicleValMetrics(**metrics)
+                    for name, metrics in epoch_vals.items()
+                }
+            )
+        return (
+            history,
+            val_history,
+            int(data.get("best_epoch", 0)),
+            float(data.get("best_mAP", float("-inf"))),
         )
 
     def _apply_freeze(self, model: nn.Module) -> None:
@@ -401,6 +522,11 @@ class VehicleReIDTrainer:
         if self.best_metric == "veri_view_acc":
             return float(epoch_vals.get("veri", VehicleValMetrics("veri")).val_view_acc or -1.0)
         return float(epoch_vals.get("veri", VehicleValMetrics("veri")).val_mAP)
+
+    def _should_run_full_eval(self, epoch: int) -> bool:
+        if self.eval_interval <= 1:
+            return True
+        return epoch % self.eval_interval == 0 or epoch == self.epochs
 
     def _build_train_loader(
         self,
@@ -537,15 +663,41 @@ class VehicleReIDTrainer:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         loss_id = criterion_id(output["id_logits"], pids)
         loss_triplet = criterion_triplet(output["embedding"], pids)
-        loss_view = torch.tensor(0.0, device=self.device)
-        if has_view.any():
-            loss_view = criterion_view(output["view_logits"][has_view], view_ids[has_view])
+        loss_view = self._compute_view_loss(output, view_ids, has_view, criterion_view)
         loss = (
             self.lambda_id * loss_id
             + self.lambda_triplet * loss_triplet
             + self.lambda_view * loss_view
         )
         return loss, loss_id, loss_triplet, loss_view
+
+    def _compute_view_loss(
+        self,
+        output: dict[str, torch.Tensor],
+        view_ids: torch.Tensor,
+        has_view: torch.Tensor,
+        criterion_view: nn.Module,
+    ) -> torch.Tensor:
+        if not has_view.any():
+            return torch.tensor(0.0, device=self.device)
+
+        by_layer = output.get("view_logits_by_layer")
+        if not by_layer:
+            return criterion_view(output["view_logits"][has_view], view_ids[has_view])
+
+        total_weight = 0.0
+        loss_view = torch.tensor(0.0, device=self.device)
+        for layer in self.view_layers:
+            logits = by_layer.get(layer)
+            if logits is None:
+                continue
+            weight = self.view_layer_weights[layer]
+            layer_loss = criterion_view(logits[has_view], view_ids[has_view])
+            loss_view = loss_view + weight * layer_loss
+            total_weight += weight
+        if total_weight <= 0:
+            return torch.tensor(0.0, device=self.device)
+        return loss_view / total_weight
 
     @torch.no_grad()
     def _validate_all(
@@ -655,6 +807,8 @@ class VehicleReIDTrainer:
                 "model_name": self.model_name,
                 "num_classes": model.num_classes,
                 "num_view_classes": self.num_view_classes,
+                "view_layers": list(self.view_layers),
+                "view_layer_weights": self.view_layer_weights,
                 "preprocess": self.preprocess,
                 "img_size": list(self.img_size),
                 "config": hparams,
@@ -666,6 +820,8 @@ class VehicleReIDTrainer:
         self,
         train: VehicleTrainMetrics,
         vals: dict[str, VehicleValMetrics],
+        *,
+        skip_val: bool = False,
     ) -> None:
         parts = [
             f"epoch={train.epoch}",
@@ -675,18 +831,21 @@ class VehicleReIDTrainer:
             f"train_loss_triplet={train.train_loss_triplet:.6f}",
             f"train_loss_view={train.train_loss_view:.6f}",
         ]
-        for name in self.datasets:
-            val = vals.get(name, VehicleValMetrics(dataset=name))
-            prefix = f"{name}_val"
-            parts.extend([
-                f"{prefix}_loss_total={val.val_loss_total:.6f}",
-                f"{prefix}_loss_id={val.val_loss_id:.6f}",
-                f"{prefix}_loss_triplet={val.val_loss_triplet:.6f}",
-                f"{prefix}_loss_view={val.val_loss_view:.6f}",
-                f"{prefix}_view_acc={val.val_view_acc:.6f}",
-                f"{prefix}_mAP={val.val_mAP:.6f}",
-                f"{prefix}_rank1={val.val_rank1:.6f}",
-            ])
+        if skip_val:
+            parts.append("val=skipped")
+        else:
+            for name in self.datasets:
+                val = vals.get(name, VehicleValMetrics(dataset=name))
+                prefix = f"{name}_val"
+                parts.extend([
+                    f"{prefix}_loss_total={val.val_loss_total:.6f}",
+                    f"{prefix}_loss_id={val.val_loss_id:.6f}",
+                    f"{prefix}_loss_triplet={val.val_loss_triplet:.6f}",
+                    f"{prefix}_loss_view={val.val_loss_view:.6f}",
+                    f"{prefix}_view_acc={val.val_view_acc:.6f}",
+                    f"{prefix}_mAP={val.val_mAP:.6f}",
+                    f"{prefix}_rank1={val.val_rank1:.6f}",
+                ])
         LOGGER.info(" ".join(parts))
 
     def _save_metrics(
@@ -722,16 +881,20 @@ class VehicleReIDTrainer:
             "data_dir": self.data_dir,
             "num_classes": num_classes,
             "num_view_classes": self.num_view_classes,
+            "view_layers": list(self.view_layers),
+            "view_layer_weights": self.view_layer_weights,
             "img_size": list(self.img_size),
             "preprocess": self.preprocess,
             "lambda_id": self.lambda_id,
             "lambda_triplet": self.lambda_triplet,
             "lambda_view": self.lambda_view,
             "checkpoint": self.checkpoint,
+            "resume": self.resume,
             "freeze_backbone": self.freeze_backbone,
             "freeze_reid_heads": self.freeze_reid_heads,
             "best_metric": self.best_metric,
             "eval_ranking": self.eval_ranking,
+            "eval_interval": self.eval_interval,
             "p": effective_p,
             "k": effective_k,
             "batch_size": batch_size,
@@ -742,6 +905,12 @@ class VehicleReIDTrainer:
         }
 
     def _make_save_dir(self) -> Path:
+        if self.resume:
+            save_dir = Path(self.resume).resolve().parent
+            if not save_dir.is_dir():
+                raise FileNotFoundError(f"Resume run directory not found: {save_dir}")
+            return save_dir
+
         base = self.project / self.name
         if base.exists():
             idx = 1

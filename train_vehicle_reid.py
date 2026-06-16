@@ -29,6 +29,11 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="Override device from config.")
     parser.add_argument("--data-dir", default=None, help="Override dataset root.")
     parser.add_argument("--name", default=None, help="Override run name.")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to last.pth (or other training checkpoint) to resume.",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -38,6 +43,8 @@ def main() -> None:
         cfg["data_dir"] = args.data_dir
     if args.name is not None:
         cfg["name"] = args.name
+    if args.resume is not None:
+        cfg["resume"] = args.resume
 
     trainer = VehicleReIDTrainer(
         model_name=cfg.get("model", "vehicle_osnet_x1_0"),
@@ -47,14 +54,18 @@ def main() -> None:
         img_size=_as_tuple(cfg.get("img_size"), (128, 256)),
         preprocess=cfg.get("preprocess", "pad_ratio_resize"),
         num_view_classes=cfg.get("num_view_classes", 8),
+        view_layers=cfg.get("view_layers"),
+        view_layer_weights=cfg.get("view_layer_weights"),
         lambda_id=cfg.get("lambda_id", 1.0),
         lambda_triplet=cfg.get("lambda_triplet", 1.0),
         lambda_view=cfg.get("lambda_view", 0.2),
         checkpoint=cfg.get("checkpoint"),
+        resume=cfg.get("resume"),
         freeze_backbone=cfg.get("freeze_backbone", False),
         freeze_reid_heads=cfg.get("freeze_reid_heads", False),
         best_metric=cfg.get("best_metric", "veri_mAP"),
         eval_ranking=cfg.get("eval_ranking", True),
+        eval_interval=cfg.get("eval_interval", 1),
         p=cfg.get("p", 16),
         k=cfg.get("k", 4),
         fallback_p=cfg.get("fallback_p", 8),

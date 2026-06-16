@@ -31,9 +31,12 @@ class BaseModelBackend:
         self.download_model(self.weights)
         self.model_name = ReIDModelRegistry.get_model_name(self.weights)
         num_view_classes = ReIDModelRegistry.get_checkpoint_num_view_classes(self.weights)
+        view_layers = ReIDModelRegistry.get_checkpoint_view_layers(self.weights)
         model_kwargs = {}
         if num_view_classes is not None:
             model_kwargs["num_view_classes"] = num_view_classes
+        if view_layers is not None:
+            model_kwargs["view_layers"] = view_layers
 
         self.model = ReIDModelRegistry.build_model(
             self.model_name,

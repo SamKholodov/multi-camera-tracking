@@ -5,6 +5,7 @@ from collections import OrderedDict
 
 import torch
 
+from core.reid.backbones.vehicle_osnet import normalize_view_layers, remap_vehicle_view_state_dict
 from core.reid.core.config import MODEL_TYPES, NR_CLASSES_DICT, TRAINED_URLS
 from core.reid.core.factory import MODEL_FACTORY
 from core.reid.utils import logger as LOGGER
@@ -89,6 +90,26 @@ class ReIDModelRegistry:
         return None
 
     @staticmethod
+    def get_checkpoint_view_layers(weight_path) -> tuple[str, ...] | None:
+        try:
+            checkpoint = torch.load(
+                weight_path,
+                map_location="cpu",
+                weights_only=False,
+                encoding="latin1",
+            )
+            if not isinstance(checkpoint, dict):
+                return None
+            if "view_layers" in checkpoint:
+                return normalize_view_layers(checkpoint["view_layers"])
+            config = checkpoint.get("config")
+            if isinstance(config, dict) and "view_layers" in config:
+                return normalize_view_layers(config["view_layers"])
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def load_pretrained_weights(model, weight_path):
         """
         Loads pretrained weights into a model.
@@ -101,6 +122,8 @@ class ReIDModelRegistry:
             encoding='latin1',
         )
         state_dict = checkpoint.get("state_dict", checkpoint)
+        if getattr(model, "view_heads", None) is not None:
+            state_dict = remap_vehicle_view_state_dict(state_dict)
         model_dict = model.state_dict()
 
         new_state_dict = OrderedDict()

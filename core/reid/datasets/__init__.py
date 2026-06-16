@@ -6,12 +6,14 @@ from typing import Any, Dict, List, Type
 
 from core.reid.datasets.base import BaseReIDDataset, CombinedReIDDataset
 from core.reid.datasets.veri776 import VeRi776
+from core.reid.datasets.veri_wild import VeRIWild
 from core.reid.datasets.vric import VRIC
 
 DATASET_REGISTRY: Dict[str, Type[BaseReIDDataset]] = {
     "veri": VeRi776,
     "veri776": VeRi776,
     "vric": VRIC,
+    "veri_wild": VeRIWild,
 }
 
 
@@ -22,6 +24,8 @@ def build_dataset(name: str, root: str, **kwargs: Any) -> BaseReIDDataset:
         key = "veri"
     if key == "vric":
         key = "vric"
+    if key in ("veriwild", "veri_wild"):
+        key = "veri_wild"
     if key not in DATASET_REGISTRY:
         raise ValueError(
             f"Unknown dataset '{name}'. Available: {sorted(DATASET_REGISTRY.keys())}"
@@ -43,6 +47,7 @@ __all__ = (
     "BaseReIDDataset",
     "CombinedReIDDataset",
     "VeRi776",
+    "VeRIWild",
     "VRIC",
     "build_dataset",
     "build_combined_dataset",
