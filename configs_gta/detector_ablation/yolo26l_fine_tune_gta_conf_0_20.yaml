@@ -37,15 +37,18 @@ multi_camera:
   - datasets/gta_mcmt/cam-3
   homos: null
   roi: auto
-  max_frames: 2000
+  max_frames: null
   association:
     gates:
-      different_cam: false
       temporal: false
-      geometry_overlap: false
       cam_transition: false
+      zone_transition: false
     reid_matching: true
-    geometry_max_distance_m: 0.0
+    geometry_distance_metric: plane
+    geometry_t_min_m: 14.0
+    geometry_t_distant_m: 0.0
+    geometry_mid_penalty: 0.15
+    same_cam_cost_add: 0.25
     max_cross_cam_gap_frames: 300
     reid_cost_threshold: 0.25
   max_history_gap_frames: 30

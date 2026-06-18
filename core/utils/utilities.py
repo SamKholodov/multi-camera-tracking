@@ -4,6 +4,10 @@ import cv2
 import numpy as np
 
 
+# Suppress near-duplicate boxes from segmentation-trained detectors (few-pixel shifts).
+DEDUP_NMS_IOU = 0.85
+
+
 class Utils:
     @staticmethod
     def filter_detections(dets):
@@ -24,6 +28,14 @@ class Utils:
             valid.append(d)
 
         return np.array(valid) if valid else np.empty((0, dets.shape[1]))
+
+    @staticmethod
+    def postprocess_detections(dets, *, nms_iou: float = DEDUP_NMS_IOU):
+        """Validate boxes and drop near-duplicate detections (class-agnostic NMS)."""
+        dets = Utils.filter_detections(dets)
+        if len(dets) == 0 or nms_iou is None:
+            return dets
+        return Utils.nms(dets, threshold=float(nms_iou), metric="iou")
 
     @staticmethod
     def convert_bbox_to_z(bbox):
@@ -136,10 +148,14 @@ class Utils:
     @staticmethod
     def nms(bboxes, threshold=0.5, metric="iou"):
         if bboxes is None or len(bboxes) == 0:
-            return np.empty((0, 5))
+            ncols = 5
+            if isinstance(bboxes, np.ndarray) and bboxes.ndim == 2:
+                ncols = bboxes.shape[1]
+            return np.empty((0, ncols), dtype=np.float32)
 
+        bboxes = np.asarray(bboxes, dtype=np.float32)
         bboxes = bboxes[np.argsort(-bboxes[:, 4])]
-        keep = []
+        keep: list[np.ndarray] = []
 
         while len(bboxes) > 0:
             current = bboxes[0]
@@ -163,7 +179,7 @@ class Utils:
 
             bboxes = rest[overlaps < threshold]
 
-        return np.array(keep)
+        return np.stack(keep, axis=0) if keep else np.empty((0, bboxes.shape[1]), dtype=np.float32)
 
     @staticmethod
     def collect_sources(root_dir):

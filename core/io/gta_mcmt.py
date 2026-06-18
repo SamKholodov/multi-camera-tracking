@@ -1,8 +1,13 @@
 """GTA MCMT synthetic dataset I/O.
 
-CSV columns (0-based):
+CSV columns (0-based), MC-GTA DatasetCreator export:
+
   0 frame_idx, 1 cam_id (image id), 2 obj_id, 3 obj_class,
-  4 license_plate, 5-8 bbox cx/cy/w/h, 9-11 world xyz, 12 confidence.
+  4 license_plate, 5-8 bbox cx/cy/w/h, 9-11 pivot world xyz,
+  12-14 bottom world xyz, 15-16 bottom_px/bottom_py,
+  17 yaw_vehicle, 18 confidence.
+
+Legacy rows without bottom/yaw (13 cols) remain supported.
 
 Images: ``cam-{N}/image_{cam_id}.jpg`` (cam_id from CSV col 1, not frame_idx).
 Sync: k-th unique snapshot row in each camera CSV = same moment across cameras.
@@ -25,6 +30,19 @@ COL_BBOX_CX = 5
 COL_BBOX_CY = 6
 COL_BBOX_W = 7
 COL_BBOX_H = 8
+COL_WORLD_X = 9
+COL_WORLD_Y = 10
+COL_WORLD_Z = 11
+COL_BOTTOM_WORLD_X = 12
+COL_BOTTOM_WORLD_Y = 13
+COL_BOTTOM_WORLD_Z = 14
+COL_BOTTOM_PX = 15
+COL_BOTTOM_PY = 16
+COL_YAW = 17
+COL_CONFIDENCE = 18
+COL_CONFIDENCE_LEGACY = 12
+COL_YAW_LEGACY = 12
+COL_CONFIDENCE_YAW_LEGACY = 13
 
 
 def scale_center_bbox(
@@ -64,6 +82,12 @@ class GtaAnnotation:
     world_x: float = 0.0
     world_y: float = 0.0
     world_z: float = 0.0
+    bottom_world_x: float | None = None
+    bottom_world_y: float | None = None
+    bottom_world_z: float | None = None
+    bottom_px: float | None = None
+    bottom_py: float | None = None
+    yaw: float | None = None
     confidence: float = 1.0
 
 
@@ -78,6 +102,8 @@ class GtaSnapshot:
 def parse_csv_row(parts: list[str]) -> GtaAnnotation | None:
     if len(parts) < 9:
         return None
+    if parts[COL_OBJ_ID] == "vehicle_id":
+        return None
     try:
         cx, cy, w, h = (
             float(parts[COL_BBOX_CX]),
@@ -85,10 +111,28 @@ def parse_csv_row(parts: list[str]) -> GtaAnnotation | None:
             float(parts[COL_BBOX_W]),
             float(parts[COL_BBOX_H]),
         )
-        world_x = float(parts[9]) if len(parts) > 9 else 0.0
-        world_y = float(parts[10]) if len(parts) > 10 else 0.0
-        world_z = float(parts[11]) if len(parts) > 11 else 0.0
-        confidence = float(parts[12]) if len(parts) > 12 else 1.0
+        world_x = float(parts[COL_WORLD_X]) if len(parts) > COL_WORLD_X else 0.0
+        world_y = float(parts[COL_WORLD_Y]) if len(parts) > COL_WORLD_Y else 0.0
+        world_z = float(parts[COL_WORLD_Z]) if len(parts) > COL_WORLD_Z else 0.0
+
+        bottom_world_x = bottom_world_y = bottom_world_z = None
+        bottom_px = bottom_py = None
+        yaw = None
+        if len(parts) > COL_CONFIDENCE:
+            bottom_world_x = float(parts[COL_BOTTOM_WORLD_X])
+            bottom_world_y = float(parts[COL_BOTTOM_WORLD_Y])
+            bottom_world_z = float(parts[COL_BOTTOM_WORLD_Z])
+            bottom_px = float(parts[COL_BOTTOM_PX])
+            bottom_py = float(parts[COL_BOTTOM_PY])
+            yaw = float(parts[COL_YAW])
+            confidence = float(parts[COL_CONFIDENCE])
+        elif len(parts) > COL_CONFIDENCE_YAW_LEGACY:
+            yaw = float(parts[COL_YAW_LEGACY])
+            confidence = float(parts[COL_CONFIDENCE_YAW_LEGACY])
+        elif len(parts) > COL_CONFIDENCE_LEGACY:
+            confidence = float(parts[COL_CONFIDENCE_LEGACY])
+        else:
+            confidence = 1.0
     except ValueError:
         return None
     if w <= 0 or h <= 0:
@@ -103,6 +147,12 @@ def parse_csv_row(parts: list[str]) -> GtaAnnotation | None:
         world_x=world_x,
         world_y=world_y,
         world_z=world_z,
+        bottom_world_x=bottom_world_x,
+        bottom_world_y=bottom_world_y,
+        bottom_world_z=bottom_world_z,
+        bottom_px=bottom_px,
+        bottom_py=bottom_py,
+        yaw=yaw,
         confidence=confidence,
     )
 
@@ -120,6 +170,8 @@ def load_snapshots(csv_path: Path) -> list[GtaSnapshot]:
                 continue
             parts = line.split(",")
             if len(parts) < 9:
+                continue
+            if parts[COL_OBJ_ID] == "vehicle_id":
                 continue
             key = (parts[COL_FRAME_IDX], parts[COL_CAM_ID])
             if key not in seen:

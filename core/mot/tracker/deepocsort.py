@@ -262,6 +262,10 @@ class DeepOcSort(BaseTracker):
         embedding_off (bool): Whether to disable appearance embeddings.
         cmc_off (bool): Whether to disable camera-motion compensation.
         aw_off (bool): Whether to disable adaptive appearance weighting.
+        use_byte (bool): Whether to run BYTE low-confidence association between
+            stage 1 and OCR.
+        min_conf (float): Lower bound for BYTE detections
+            (``min_conf < score <= det_thresh``).
         Q_xy_scaling (float): Process-noise scaling for position coordinates.
         Q_s_scaling (float): Process-noise scaling for scale coordinates.
         **kwargs: Base tracker settings forwarded to :class:`BaseTracker`,
@@ -288,6 +292,8 @@ class DeepOcSort(BaseTracker):
         embedding_off: bool = False,
         cmc_off: bool = False,
         aw_off: bool = False,
+        use_byte: bool = False,
+        min_conf: float = 0.1,
         Q_xy_scaling: float = 0.01,
         Q_s_scaling: float = 0.0001,
         **kwargs: Any,  # BaseTracker parameters
@@ -318,7 +324,14 @@ class DeepOcSort(BaseTracker):
         self.embedding_off = embedding_off
         self.cmc_off = cmc_off
         self.aw_off = aw_off
-        
+        self.use_byte = bool(use_byte)
+        self.min_conf = float(min_conf)
+        if self.use_byte and self.min_conf >= self.det_thresh:
+            raise ValueError(
+                f"use_byte requires min_conf < det_thresh, got "
+                f"min_conf={self.min_conf} det_thresh={self.det_thresh}"
+            )
+
     def update(
         self, dets: np.ndarray, img: np.ndarray, embs: Optional[np.ndarray] = None
     ) -> np.ndarray:
@@ -349,6 +362,11 @@ class DeepOcSort(BaseTracker):
         scores = dets[:, 4]
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
         assert dets.shape[1] == 7
+        if self.use_byte:
+            inds_second = (scores > self.min_conf) & (scores <= self.det_thresh)
+            dets_second = dets[inds_second]
+        else:
+            dets_second = np.empty((0, 7), dtype=dets.dtype)
         remain_inds = scores > self.det_thresh
         dets = dets[remain_inds]
 
@@ -452,6 +470,29 @@ class DeepOcSort(BaseTracker):
                 alpha=alpha,
                 conf=float(dets[m[0], 4]),
             )
+
+        if (
+            self.use_byte
+            and len(dets_second) > 0
+            and unmatched_trks.shape[0] > 0
+        ):
+            u_trks = trks[unmatched_trks]
+            iou_byte = self.asso_func(dets_second[:, :4], u_trks)
+            iou_byte = np.asarray(iou_byte)
+            if iou_byte.size > 0 and iou_byte.max() > self.iou_threshold:
+                byte_matches = linear_assignment(-iou_byte)
+                to_remove_trk_indices = []
+                for m in byte_matches:
+                    det_ind, local_trk_ind = int(m[0]), int(m[1])
+                    global_trk_ind = int(unmatched_trks[local_trk_ind])
+                    if iou_byte[det_ind, local_trk_ind] < self.iou_threshold:
+                        continue
+                    self.active_tracks[global_trk_ind].update(dets_second[det_ind, :])
+                    to_remove_trk_indices.append(global_trk_ind)
+                if to_remove_trk_indices:
+                    unmatched_trks = np.setdiff1d(
+                        unmatched_trks, np.array(to_remove_trk_indices, dtype=int)
+                    )
 
         """
             Second round of associaton by OCR

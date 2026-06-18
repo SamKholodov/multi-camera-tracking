@@ -1,0 +1,12 @@
+output_dir: datasets/gta_mcmt_with_points/contact_point
+project: runs/contact_point
+name: mobilenetv3_small_gta_points
+train:
+  device: cuda:0
+  img_size: 224
+  batch_size: 64
+  epochs: 50
+  lr: 1.0e-3
+  num_workers: 4
+  bbox_pad_ratio: 0.05
+  require_viz: true

@@ -3,13 +3,13 @@ from .cross_camera import (
     association_cost_for_match,
     CrossCameraAssociationConfig,
     classify_scenario,
-    geometry_penalty,
+    geometry_cost_adjustment,
     min_overlap_distance_m,
-    passes_gates,
     passes_hard_gates,
     reid_cost_for_match,
-    temporal_penalty,
+    uses_geometry_tiers,
 )
+from .same_frame_link import find_same_frame_links
 
 __all__ = [
     "associate",
@@ -17,10 +17,10 @@ __all__ = [
     "CrossCameraAssociationConfig",
     "association_cost_for_match",
     "classify_scenario",
-    "geometry_penalty",
+    "geometry_cost_adjustment",
+    "find_same_frame_links",
     "min_overlap_distance_m",
-    "passes_gates",
     "passes_hard_gates",
     "reid_cost_for_match",
-    "temporal_penalty",
+    "uses_geometry_tiers",
 ]

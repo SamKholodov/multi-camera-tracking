@@ -165,6 +165,9 @@ def run_from_config(config):
             else np.eye(3, dtype=np.float64)
         )
 
+        from pipeline import _maybe_build_contact_point_model
+
+        contact_cfg = config.get("contact_point")
         pipeline = SingleCameraTrackerPipeline(
             source=source,
             tracker_config=tracker_cfg,
@@ -178,6 +181,14 @@ def run_from_config(config):
             max_history_gap_frames=int(single_cfg.get("max_history_gap_frames", 30)),
             roi_path=roi_path,
             detection_file=det_file,
+            world_anchor=str(config.get("world_anchor", "bottom_center")),
+            contact_point_model=_maybe_build_contact_point_model(contact_cfg),
+            contact_batch_size=(
+                int(contact_cfg["batch_size"])
+                if contact_cfg and contact_cfg.get("batch_size") is not None
+                else None
+            ),
+            contact_conf_thresh=float(contact_cfg.get("conf_thresh", 0.0)) if contact_cfg else 0.0,
         )
         pipeline.run(
             visualize=visualize,
@@ -194,7 +205,10 @@ def run_from_config(config):
             raise ValueError("multi_camera.sources is empty in config")
 
         detection_files = _maybe_detection_files(sources, detector_cfg)
-        association_cfg = CrossCameraAssociationConfig.from_yaml(multi_cfg)
+        output_fps = float(output_cfg.get("video_fps", 10))
+        assoc_multi_cfg = dict(multi_cfg)
+        assoc_multi_cfg["video_fps"] = output_fps
+        association_cfg = CrossCameraAssociationConfig.from_yaml(assoc_multi_cfg)
         max_frames = multi_cfg.get("max_frames")
         if max_frames is not None:
             max_frames = int(max_frames)
@@ -229,9 +243,11 @@ def run_from_config(config):
             results_dir=multi_cfg.get("results_dir"),
             roi_paths=_maybe_roi_paths(sources, multi_cfg.get("roi")),
             detection_files=detection_files,
-            video_fps=float(output_cfg.get("video_fps", 10)),
+            video_fps=output_fps,
             association_config=association_cfg,
             max_frames=max_frames,
+            world_anchor=str(config.get("world_anchor", "bottom_center")),
+            contact_point_config=config.get("contact_point"),
         )
         pipeline.run(
             visualize=visualize,

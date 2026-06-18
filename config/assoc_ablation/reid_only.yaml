@@ -1,10 +1,13 @@
-# Association ablation: ReID-only baseline without staged gates.
+# Cross-camera association: ReID cost only.
+# No homography, geometry tiers, zones, temporal / speed / trajectory gates.
 # Run: python run.py --config config/assoc_ablation/reid_only.yaml
+# Eval: python scripts/eval_gta_mcmt.py --pred-dir outputs/configs_gta/assoc_ablation/reid_only/per_cam --apply-roi --align-pred-frames
 
 run_mode: multi_camera
+world_anchor: bottom_center
 
 detector:
-  model: models/yolo26l.pt
+  model: models/yolo26l_fine_tune_gta.pt
   target_classes: [2, 3, 5, 7]
   conf_thres: 0.2
   imgsz: 960
@@ -13,7 +16,8 @@ detector:
 tracker:
   type: deepocsort
   use_embeddings: true
-  reid_weights: models/osnet_ibn_x1_0_msmt17.pt
+  reid_weights: runs/vehicle_reid/osnet_x1_0_veri_vric_wild/epoch_120.pth
+  reid_preprocess: pad_ratio_resize
   device: 0
   half: false
   det_thresh: 0.3
@@ -21,7 +25,7 @@ tracker:
   min_hits: 5
   iou_threshold: 0.3
   appearance_update: ema
-  reid_accum_conf_thresh: 0.6
+  reid_accum_conf_thresh: 0.5
 
 multi_camera:
   cam_ids: [6, 7, 8, 9]
@@ -30,27 +34,36 @@ multi_camera:
     - datasets/validation/S02/c007/vdo_synch.avi
     - datasets/validation/S02/c008/vdo_synch.avi
     - datasets/validation/S02/c009/vdo_synch.avi
-  homos:
-    - datasets/validation/S02/c006/calibration.txt
-    - datasets/validation/S02/c007/calibration.txt
-    - datasets/validation/S02/c008/calibration.txt
-    - datasets/validation/S02/c009/calibration.txt
+  homos: null
   roi: auto
+  max_frames: null
   association:
     gates:
-      different_cam: false
       temporal: false
-      geometry_overlap: false
       cam_transition: false
+      zone_transition: false
     reid_matching: true
-    geometry_max_distance_m: 9.0
+    geometry_distance_metric: plane
+    geometry_t_min_m: 14.0
+    geometry_t_distant_m: 0.0
+    geometry_mid_penalty: 0.0
+    same_cam_cost_add: 0.0
+    same_frame_linking: false
+    reid_strong_reject_threshold: 0.5
     max_cross_cam_gap_frames: 300
-    reid_cost_threshold: 0.25
+    reid_cost_threshold: 0.7
+    video_fps: 30.0
+    temporal_mode: 'off'
+    speed_limit_enabled: false
+    trajectory_enabled: false
+    global_delete_after_frames: 600
+  association_cost_threshold: 0.7
   max_history_gap_frames: 300
+  video_fps: 30.0
   results_dir: outputs/assoc_ablation/reid_only
 
 output:
-  video_fps: 10
+  video_fps: 30.0
   visualize: false
   save_video: false
   save_video_dir: outputs/assoc_ablation/reid_only/videos

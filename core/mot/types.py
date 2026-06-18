@@ -31,6 +31,9 @@ def homography_valid(H_image_to_world) -> bool:
 def enrich_tracks_world(
     tracks: np.ndarray,
     H_image_to_world: np.ndarray,
+    *,
+    world_anchor: str = "bottom_center",
+    contact_uv_by_det: np.ndarray | None = None,
 ) -> np.ndarray:
     """Pad to ``(N, 10)`` and fill xworld/yworld or ``(-1, -1)``."""
     if tracks is None or len(tracks) == 0:
@@ -45,13 +48,28 @@ def enrich_tracks_world(
         out[:, TRACK_COL_YWORLD] = WORLD_COORD_MISSING
         return out
 
-    from core.io.calibration import project_bbox_bottom_center
+    from core.io.calibration import project_bbox_bottom_center, project_point
+    from core.geometry.contact_point.model import uv_to_pixel
 
     H = np.asarray(H_image_to_world, dtype=np.float64)
+    use_contact = str(world_anchor).lower().strip() == "contact_point"
     for i in range(n):
-        xw, yw = project_bbox_bottom_center(
-            H, out[i, 0], out[i, 1], out[i, 2], out[i, 3]
-        )
+        x1, y1, x2, y2 = map(float, out[i, :4])
+        has_detection = int(out[i, 7]) if out.shape[1] > 7 else 1
+        det_idx = int(out[i, 6]) if out.shape[1] > 6 else -1
+
+        xw, yw = project_bbox_bottom_center(H, x1, y1, x2, y2)
+        if (
+            use_contact
+            and has_detection == 1
+            and contact_uv_by_det is not None
+            and 0 <= det_idx < len(contact_uv_by_det)
+        ):
+            uv = contact_uv_by_det[det_idx]
+            if np.all(np.isfinite(uv)):
+                px, py = uv_to_pixel(uv, (x1, y1, x2, y2))
+                xw, yw = project_point(H, px, py)
+
         out[i, TRACK_COL_XWORLD] = xw
         out[i, TRACK_COL_YWORLD] = yw
     return out

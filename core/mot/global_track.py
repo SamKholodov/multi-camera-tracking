@@ -114,6 +114,22 @@ class GlobalTrack:
                 return obs.bbox
         return None
 
+    def recent_world_observations(
+        self,
+        k: int,
+    ) -> list[tuple[int, tuple[float, float]]]:
+        out: list[tuple[int, tuple[float, float]]] = []
+        for frame_idx, slot in zip(reversed(self.frames), reversed(self.cam_observations)):
+            points = [obs.wpt for obs in slot.values() if obs.has_detection and obs.wpt is not None]
+            if not points:
+                continue
+            x = sum(float(p[0]) for p in points) / len(points)
+            y = sum(float(p[1]) for p in points) / len(points)
+            out.append((int(frame_idx), (x, y)))
+            if len(out) >= int(k):
+                break
+        return list(reversed(out))
+
     def _ensure_frame_slot(self, frame_idx: int) -> dict[int, CamObservation]:
         frame_idx = int(frame_idx)
         if self.frames and self.frames[-1] == frame_idx:
@@ -262,6 +278,31 @@ class GlobalTrackStore:
         track = self.tracks.get(int(gid))
         if track is not None:
             track.mark_local_key_removed((cam_id, local_tid))
+
+    def merge(self, gid_keep: int, gid_drop: int) -> None:
+        """Merge gid_drop history into gid_keep and remove gid_drop."""
+        gid_keep = int(gid_keep)
+        gid_drop = int(gid_drop)
+        if gid_keep == gid_drop or gid_drop not in self.tracks:
+            return
+        keep = self.tracks[gid_keep]
+        drop = self.tracks.pop(gid_drop)
+        keep.start_frame = min(keep.start_frame, drop.start_frame)
+        keep._removed_local_keys |= drop._removed_local_keys
+        for frame_idx, slot in zip(drop.frames, drop.cam_observations):
+            for cam_id, obs in slot.items():
+                keep.append_observation(frame_idx, cam_id, obs)
+        if drop.last_seen_cam is not None:
+            keep_last = keep.cam_last_frame.get(keep.last_seen_cam, -1) if keep.last_seen_cam is not None else -1
+            drop_last = drop.cam_last_frame.get(drop.last_seen_cam, -1)
+            if drop_last >= keep_last:
+                keep.last_seen_cam = drop.last_seen_cam
+                if drop.last_seen_world is not None:
+                    keep.last_seen_world = drop.last_seen_world
+                if drop.last_seen_zone is not None:
+                    keep.last_seen_zone = drop.last_seen_zone
+        keep.active_cameras |= drop.active_cameras
+        keep.active_zones |= drop.active_zones
 
     def finalize_frame(
         self,
