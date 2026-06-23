@@ -1,0 +1,75 @@
+{
+  "selection_criterion": "best MCMT IDF1 per dataset and tracker (eval_gta_mcmt / eval_s02, IoU 0.5 CityFlow / 0.7 GTA, ROI on GTA)",
+  "generated_from": [
+    "outputs/configs_gta/diploma_metrics.csv",
+    "outputs/configs_cityflow/diploma_metrics.csv",
+    "outputs/demo/gta_mcmt_botsort_ibn (BotSort eval)"
+  ],
+  "gta_mcmt_best_deepocsort": {
+    "config": "best_configs/gta_mcmt_best_deepocsort.yaml",
+    "alias": "best_configs/gta_mcmt_best.yaml",
+    "source_ablation": "configs_gta/geo_ablation/geo_tight.yaml",
+    "ablation_id": "geo_ablation/geo_tight",
+    "detector": "models/yolo26l_fine_tune_gta.pt",
+    "reid": "runs/vehicle_reid/osnet_x1_0_veri_vric_wild/epoch_120.pth",
+    "tracker": "deepocsort + ema",
+    "mcmt_gates": {
+      "geometry": "plane, t_min=5m, t_distant=15m",
+      "contact_point": true,
+      "temporal": "off",
+      "zone_transition": false
+    },
+    "metrics": {
+      "sct": {"idf1": 0.659, "idp": 0.775, "idr": 0.572, "mota": 0.532},
+      "mcmt": {"idf1": 0.513, "idp": 0.604, "idr": 0.446, "mota": 0.526}
+    }
+  },
+  "gta_mcmt_best_botsort": {
+    "config": "best_configs/gta_mcmt_best_botsort.yaml",
+    "source_ablation": "same association stack as geo_tight + contact_point",
+    "detector": "models/yolo26l_fine_tune_gta.pt",
+    "reid": "models/osnet_ibn_x1_0_msmt17.pt",
+    "tracker": "botsort + ema",
+    "mcmt_gates": {
+      "geometry": "plane, t_min=5m, t_distant=15m",
+      "contact_point": true,
+      "temporal": "off",
+      "zone_transition": false
+    },
+    "metrics": {
+      "sct": {"idf1": 0.685, "idp": 0.799, "idr": 0.599, "mota": 0.547},
+      "mcmt": {"idf1": 0.566, "idp": 0.660, "idr": 0.495, "mota": 0.544}
+    },
+    "notes": "Highest GTA MCMT in project; README demo clip uses this run."
+  },
+  "cityflow_mcmt_best": {
+    "config": "best_configs/cityflow_mcmt_best.yaml",
+    "source_ablation": "configs_cityflow/temporal_ablation/temporal_penalty_N50.yaml",
+    "ablation_id": "temporal_ablation/temporal_penalty_N50",
+    "detector": "models/yolo26l.pt",
+    "reid": "runs/vehicle_reid/osnet_x1_0_veri_vric_wild/epoch_120.pth",
+    "tracker": "deepocsort + ema",
+    "mcmt_gates": {
+      "geometry": "gps, t_min=14m, t_distant=38m",
+      "temporal": "penalty_only, max_gap=50 frames",
+      "zone_transition": false
+    },
+    "metrics": {
+      "sct": {"idf1": 0.4748, "idp": 0.3668, "idr": 0.6730, "mota": -0.4275},
+      "mcmt": {"idf1": 0.3334, "idp": 0.3332, "idr": 0.3337, "mota": -0.2045}
+    },
+    "runners_up_mcmt": [
+      {"ablation": "geo_ablation/geo_tight_temporal_N15_p015", "idf1": 0.3305},
+      {"ablation": "geo_ablation/geo_tight_temporal_N50", "idf1": 0.3318},
+      {"ablation": "zone_tracklet/zone_tracklet", "idf1": 0.2621}
+    ]
+  },
+  "notes": {
+    "gta_tracker_choice": "BotSort+IBN beats DeepOcSort+wild ReID on GTA MCMT (+5.3pp); DeepOcSort remains the ablation baseline.",
+    "best_sct_only": {
+      "gta": "byte_ablation/byte_on_det03 (SCT IDF1 70.5%, MCMT lower)",
+      "cityflow": "conf_ablation/conf_0_60 (SCT IDF1 53.8%, MCMT 25.1%)"
+    },
+    "detector_sweep": "8-model backbone sweep not run; only GTA fine-tune vs generic compared (2k frames)"
+  }
+}

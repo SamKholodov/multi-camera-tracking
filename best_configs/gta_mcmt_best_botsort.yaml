@@ -1,0 +1,79 @@
+# Best GTA MCMT — BotSort + OSNet-IBN (same association stack as DeepOcSort best).
+# MCMT IDF1 56.6% | SCT IDF1 68.5% (full GTA, IoU 0.7, ROI).
+# Run: python run.py --config best_configs/gta_mcmt_best_botsort.yaml
+#
+# README MCMT demo clip is built from this run's per_cam predictions.
+
+run_mode: multi_camera
+world_anchor: contact_point
+detector:
+  model: models/yolo26l_fine_tune_gta.pt
+  target_classes:
+  - 2
+  - 3
+  - 5
+  - 7
+  conf_thres: 0.2
+  imgsz: 1920
+  device: 0
+tracker:
+  type: botsort
+  use_default_reid: true
+  reid_weights: models/osnet_ibn_x1_0_msmt17.pt
+  device: 0
+  half: false
+  appearance_update: ema
+multi_camera:
+  cam_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  sources:
+  - datasets/gta_mcmt/cam-0
+  - datasets/gta_mcmt/cam-1
+  - datasets/gta_mcmt/cam-2
+  - datasets/gta_mcmt/cam-3
+  homos:
+  - datasets/gta_mcmt/cam-0/calibration.txt
+  - datasets/gta_mcmt/cam-1/calibration.txt
+  - datasets/gta_mcmt/cam-2/calibration.txt
+  - datasets/gta_mcmt/cam-3/calibration.txt
+  roi: auto
+  max_frames: null
+  association:
+    gates:
+      temporal: false
+      cam_transition: false
+      zone_transition: false
+    reid_matching: true
+    geometry_distance_metric: plane
+    geometry_t_min_m: 5.0
+    geometry_t_distant_m: 15.0
+    geometry_mid_penalty: 0.15
+    same_cam_cost_add: 0.25
+    same_frame_linking: false
+    reid_strong_reject_threshold: 0.7
+    max_cross_cam_gap_frames: 100
+    reid_cost_threshold: 0.7
+    video_fps: 30.0
+    temporal_mode: 'off'
+    speed_limit_enabled: false
+    trajectory_enabled: false
+    global_delete_after_frames: 600
+  association_cost_threshold: 0.7
+  max_history_gap_frames: 100
+  video_fps: 30.0
+  results_dir: outputs/best_configs/gta_mcmt_best_botsort
+output:
+  video_fps: 30.0
+  visualize: false
+  save_video: false
+  save_video_dir: outputs/best_configs/gta_mcmt_best_botsort/videos
+  output_path: outputs/best_configs/gta_mcmt_best_botsort/multicam.mp4
+contact_point:
+  enabled: true
+  weights: runs/contact_point/mobilenetv3_small_gta_points/best.pth
+  conf_thresh: 0.2
+  batch_size: 256
+  device: cuda:0
