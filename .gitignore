@@ -50,6 +50,19 @@ datasets/cam_loc/
 datasets/cam_timestamp/
 datasets/cam_framenum/
 
+# Local datasets (download separately)
+gta_reid_fine_tune/
+scripts/_tmp_gta_reid/
+scripts/_tmp_cityflow_reid/
+datasets/gta_mcmt/
+datasets/gta_mcmt_with_points/
+wild/
+datasets/AICity22_Track1_MTMC_Tracking/eval/
+datasets/AICity22_Track1_MTMC_Tracking/list_cam.txt
+datasets/AICity22_Track1_MTMC_Tracking/test/
+datasets/AICity22_Track1_MTMC_Tracking/train/
+datasets/AICity22_Track1_MTMC_Tracking/validation/
+
 # Generated from calibration.txt (run.py creates on first load)
 **/calibration_i2w.txt
 datasets/validation/S02/gt_for_eval.txt
@@ -61,6 +74,7 @@ datasets/validation/S02/gt_for_eval.txt
 *.tgz
 *.tar.gz
 *.zip
+!docs/assets/readme/*.mp4
 
 # Local runs / debug
 commands.local.yaml
@@ -70,6 +84,15 @@ wandb/
 runs/
 polygons_output/
 check_dist/
+test_bbox12/
+test_bbox12_check/
+frame.jpg
+
+# Local dev only (not part of public repo)
+tests/
+gta_demonstration/
+best_configs/*.local.yaml
+outputs/demo/
 
 # Vehicle ReID datasets (VeRi-776, VRIC — download separately)
 reid_datasets/
