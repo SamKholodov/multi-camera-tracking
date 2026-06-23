@@ -77,6 +77,21 @@ def load_mot(path: Path) -> np.ndarray:
     return data
 
 
+def s02_gt_max_frame(gt_root: Path, cameras: list[int] | None = None) -> int:
+    """Return the maximum GT frame index across S02 cameras."""
+    if cameras is None:
+        cameras = [6, 7, 8, 9]
+    mx = 0
+    for cam in cameras:
+        gt_path = gt_root / f"c{cam:03d}" / "gt" / "gt.txt"
+        if not gt_path.is_file():
+            continue
+        gt = load_mot(gt_path)
+        if len(gt):
+            mx = max(mx, int(gt[:, 0].max()))
+    return mx
+
+
 _load_mot = load_mot
 
 
@@ -134,8 +149,14 @@ def evaluate_s02(
     apply_roi: bool = False,
     cityflow_protocol: bool = False,
     pred_id_mode: Literal["auto", "global", "local"] = "auto",
+    align_sync: bool = True,
 ) -> dict:
-    """Load GT/predictions and return per-camera + MCMT metric dicts."""
+    """Load GT/predictions and return per-camera + MCMT metric dicts.
+
+    When ``align_sync`` is True and ``gt_root/sync_manifest.json`` exists,
+    GT frame indices are shifted per camera to match ``vdo_synch.avi`` and
+    predictions are capped to ``sync_length_frames``.
+    """
     if cameras is None:
         cameras = [6, 7, 8, 9]
 
@@ -159,6 +180,16 @@ def evaluate_s02(
 
     if not gt_by_cam:
         raise SystemExit("No GT files found, nothing to evaluate.")
+
+    if align_sync:
+        from scripts.cityflow_sync_eval import apply_sync_alignment
+
+        gt_by_cam, pr_by_cam, manifest = apply_sync_alignment(gt_by_cam, pr_by_cam, gt_root)
+        if manifest is not None:
+            print(
+                f"[INFO] Sync-aligned eval: length={manifest.get('sync_length_frames')} "
+                f"(skips from sync_manifest.json)"
+            )
 
     if cityflow_protocol:
         pr_by_cam = apply_cityflow_filters(
@@ -256,6 +287,14 @@ def _run_eval_pass(
 
     if not gt_by_cam:
         raise SystemExit("No GT files found, nothing to evaluate.")
+
+    from scripts.cityflow_sync_eval import apply_sync_alignment
+
+    gt_by_cam, pr_by_cam, manifest = apply_sync_alignment(gt_by_cam, pr_by_cam, gt_root)
+    if manifest is not None:
+        print(
+            f"[INFO] Sync-aligned eval: length={manifest.get('sync_length_frames')}"
+        )
 
     if cityflow_protocol:
         pr_by_cam = apply_cityflow_filters(

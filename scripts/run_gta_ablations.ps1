@@ -118,7 +118,7 @@ if ($selected -contains "assoc") {
     $assocRuns = @(
         @{ Name = "reid_only"; Pred = "outputs/configs_gta/assoc_ablation/reid_only/per_cam" },
         @{ Name = "+zone_tracklet"; Pred = "outputs/configs_gta/assoc_ablation/+zone_tracklet/per_cam" },
-        @{ Name = "+geometry_overlap"; Pred = "outputs/configs_gta/assoc_ablation/+geometry_overlap/per_cam" }
+        @{ Name = "no_different_cam_geo_tiers"; Pred = "outputs/configs_gta/assoc_ablation/no_different_cam_geo_tiers/per_cam" }
     )
     foreach ($run in $assocRuns) {
         $cfg = "configs_gta/assoc_ablation/$($run.Name).yaml"

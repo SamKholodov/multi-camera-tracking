@@ -61,6 +61,55 @@ def gta_gt_path(gt_root: Path, cam: int) -> Path:
     return gt_root / f"cam-{cam}" / "gt" / "gt.txt"
 
 
+def gta_gt_max_frame(gt_root: Path, cameras: list[int] | None = None) -> int:
+    """Last 1-based frame id present in per-camera GT files."""
+    if cameras is None:
+        cameras = list(range(NUM_CAMERAS))
+    mx = 0
+    for cam in cameras:
+        gt_path = gta_gt_path(gt_root, cam)
+        if not gt_path.is_file():
+            continue
+        data = load_mot(gt_path)
+        if len(data):
+            mx = max(mx, int(data[:, 0].max()))
+    return mx
+
+
+def pred_max_frame(pred_dir: Path, cameras: list[int] | None = None) -> int:
+    """Last 1-based frame id present in per-camera prediction files."""
+    if cameras is None:
+        cameras = list(range(NUM_CAMERAS))
+    mx = 0
+    for cam in cameras:
+        pr_path = pred_dir / f"c{cam:03d}.txt"
+        if not pr_path.is_file():
+            continue
+        data = load_mot(pr_path)
+        if len(data):
+            mx = max(mx, int(data[:, 0].max()))
+    return mx
+
+
+def resolve_eval_max_frame(
+    gt_root: Path,
+    pred_dir: Path,
+    cameras: list[int] | None = None,
+) -> tuple[int | None, int, int]:
+    """Return ``(eval_max_frame, pred_max, gt_max)``.
+
+    When predictions end before GT, cap eval to ``pred_max`` so metrics are not
+    dominated by false misses on unseen frames.
+    """
+    gt_max = gta_gt_max_frame(gt_root, cameras)
+    pred_mx = pred_max_frame(pred_dir, cameras)
+    if pred_mx <= 0:
+        return None, pred_mx, gt_max
+    if pred_mx < gt_max:
+        return pred_mx, pred_mx, gt_max
+    return None, pred_mx, gt_max
+
+
 def _load_gt_pred(
     gt_root: Path,
     pred_dir: Path,
@@ -192,7 +241,25 @@ def main() -> None:
         action="store_true",
         help="Filter GT and predictions with cam-N/roi.jpg (CityFlow bottom-center rule)",
     )
+    ap.add_argument(
+        "--align-pred-frames",
+        action="store_true",
+        help="Cap GT to the last predicted frame when preds are shorter than GT",
+    )
     args = ap.parse_args()
+
+    if args.align_pred_frames and args.max_frame is None:
+        eval_cap, pred_mx, gt_mx = resolve_eval_max_frame(
+            args.gt_root, args.pred_dir, args.cameras
+        )
+        if eval_cap is not None:
+            print(
+                f"[WARN] align-pred-frames: eval capped to frame {eval_cap} "
+                f"(pred_max={pred_mx}, GT={gt_mx})"
+            )
+            args.max_frame = eval_cap
+        elif pred_mx > 0 and pred_mx >= gt_mx:
+            print(f"[OK] pred_max={pred_mx} covers GT max_frame={gt_mx}")
 
     gt_by_cam: dict[int, np.ndarray] = {}
     pr_by_cam: dict[int, np.ndarray] = {}

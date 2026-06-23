@@ -35,7 +35,7 @@ RUNS: list[tuple[str, str, str]] = [
     ),
     ("assoc_ablation", "reid_only", "assoc_ablation/reid_only/per_cam"),
     ("assoc_ablation", "+zone_tracklet", "assoc_ablation/+zone_tracklet/per_cam"),
-    ("assoc_ablation", "+geometry_overlap", "assoc_ablation/+geometry_overlap/per_cam"),
+    ("assoc_ablation", "no_different_cam_geo_tiers", "assoc_ablation/no_different_cam_geo_tiers/per_cam"),
 ]
 
 
