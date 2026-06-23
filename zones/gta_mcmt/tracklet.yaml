@@ -1,0 +1,3 @@
+tracklet:
+  stabilize_frames: 5
+  fail_open: true

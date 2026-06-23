@@ -1,0 +1,51 @@
+run_mode: multi_camera
+detector:
+  model: models/yolo26l.pt
+  target_classes:
+  - 2
+  - 3
+  - 5
+  - 7
+  conf_thres: 0.2
+  imgsz: 640
+  device: 0
+tracker:
+  type: deepocsort
+  use_embeddings: true
+  reid_weights: models/osnet_ibn_x1_0_msmt17.pt
+  device: 0
+  half: false
+  det_thresh: 0.25
+  max_age: 30
+  min_hits: 5
+  iou_threshold: 0.3
+  appearance_update: aaf
+  reid_accum_conf_thresh: 0.6
+  use_byte: true
+  min_conf: 0.15
+multi_camera:
+  cam_ids:
+  - 6
+  - 7
+  - 8
+  - 9
+  sources:
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c006/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c007/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c008/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c009/vdo_synch.avi
+  homos: null
+  roi: auto
+  max_frames: null
+  results_dir: outputs/configs_cityflow/byte_ablation/byte_on_narrow
+  association_cost_threshold: 0.25
+  association_reid_weight: 0.5
+  geometry_max_distance: 0.0
+  max_cross_cam_gap_frames: 100
+  max_history_gap_frames: 30
+output:
+  video_fps: 10.0
+  visualize: false
+  save_video: false
+  save_video_dir: outputs/configs_cityflow/byte_ablation/byte_on_narrow/videos
+  output_path: outputs/configs_cityflow/byte_ablation/byte_on_narrow/multicam.mp4
