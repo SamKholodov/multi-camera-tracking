@@ -103,6 +103,10 @@ reid_datasets/
 # Legacy entry point (use run.py)
 main.py
 
+
+# Markdown (only root README may be tracked)
+*.md
+!README.md
 # Papers / misc (optional local files)
 *.pdf
 
