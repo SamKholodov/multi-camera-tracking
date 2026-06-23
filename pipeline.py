@@ -145,9 +145,9 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
         device = cfg.pop("device", 0)
         half = bool(cfg.pop("half", False))
         custom_reid_extractor = cfg.pop("custom_reid_extractor", None)
+        appearance_update = cfg.pop("appearance_update", "aaf")
+        reid_accum_conf_thresh = cfg.pop("reid_accum_conf_thresh", None)
         for k in ("use_embeddings", "reid_preprocess", "share_reid_model", "batch_reid"):
-            cfg.pop(k, None)
-        for k in appearance_keys:
             cfg.pop(k, None)
         reid_model = None
         if use_default_reid:
@@ -164,11 +164,15 @@ def _create_tracker(tracker_config, *, shared_reid_model=None):
             reid_model=reid_model,
             use_default_reid=use_default_reid,
             custom_reid_extractor=custom_reid_extractor,
+            appearance_update=appearance_update,
             **cfg,
         )
     for k in (*reid_keys, *appearance_keys):
         cfg.pop(k, None)
-    return BotSortTracker(**cfg)
+    raise ValueError(
+        f"Unknown tracker.type={tracker_type!r}. "
+        "Supported: sort, botsort, deepocsort, deep_ocsort"
+    )
 
 
 class SingleCameraTrackerPipeline:
@@ -1057,9 +1061,9 @@ class MultiCameraTrackingPipeline:
                     query_bbox,
                     query_local_tid=local_tid,
                 )
-                if cost is None:
+                if cost is None or not np.isfinite(cost):
                     continue
-                col_entries.setdefault(gid, []).append((i, cost))
+                col_entries.setdefault(gid, []).append((i, float(cost)))
 
         col_gid = sorted(col_entries.keys())
         n_g = len(col_gid)
@@ -1078,6 +1082,10 @@ class MultiCameraTrackingPipeline:
         s = max(n_u, n_g)
         P = np.full((s, s), COST_INF, dtype=np.float64)
         P[:n_u, :n_g] = C
+        bad = ~np.isfinite(P)
+        if bad.any():
+            P = P.copy()
+            P[bad] = COST_INF
         ri, ci = linear_sum_assignment(P)
 
         used_local = set()

@@ -170,8 +170,16 @@ class ReIDModelRegistry:
         except Exception:
             pass
         # Extract dataset name from weights name, then look up in the class dictionary
-        dataset_key = weights.name.split("_")[1]
-        return NR_CLASSES_DICT.get(dataset_key, 1)
+        stem = weights.stem
+        lookup = weights.parent.name if stem in {"best", "last", "checkpoint"} else stem
+        parts = lookup.split("_")
+        for key in NR_CLASSES_DICT:
+            if key in lookup:
+                return NR_CLASSES_DICT[key]
+        if len(parts) > 1:
+            dataset_key = parts[1]
+            return NR_CLASSES_DICT.get(dataset_key, 1)
+        return 1
 
     @staticmethod
     def build_model(

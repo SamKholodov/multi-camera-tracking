@@ -37,6 +37,8 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine dissimilarity for (possibly unnormalized) vectors."""
     a_n = normalize_l2(a)
     b_n = normalize_l2(b)
+    if not np.isfinite(a_n).all() or not np.isfinite(b_n).all():
+        return 1.0
     return float(1.0 - np.clip(np.dot(a_n, b_n), -1.0, 1.0))
 
 

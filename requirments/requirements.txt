@@ -10,3 +10,4 @@ PyYAML>=6.0.1,<7
 filterpy>=1.4.5,<2
 lapx>=0.5.5
 motmetrics>=1.4.0,<2
+matplotlib>=3.8.0,<4

@@ -2,6 +2,9 @@ from typing import Any, Optional, Type
 
 import numpy as np
 
+from core.mot.appearance import normalize_appearance_mode, normalized_for_matching
+
+
 def _import_boxmot_botsort():
     """BoxMOT moved BotSort between releases; try known entry points."""
     candidates = (
@@ -24,16 +27,28 @@ def _import_boxmot_botsort():
 _BoxmotBotSort = _import_boxmot_botsort()
 
 
+def _finite_feature_vector(feat) -> np.ndarray | None:
+    try:
+        arr = np.asarray(feat, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size == 0 or not np.isfinite(arr).all():
+        return None
+    return arr
+
+
 class BotSortTracker:
     def __init__(
         self,
         reid_model=None,
         use_default_reid=True,
         custom_reid_extractor=None,
+        appearance_update: str = "aaf",
         **tracker_kwargs,
     ):
         self.use_default_reid = bool(use_default_reid)
         self.custom_reid_extractor = custom_reid_extractor
+        self.appearance_update = normalize_appearance_mode(appearance_update)
 
         common = dict(
             track_high_thresh=0.5,
@@ -74,7 +89,12 @@ class BotSortTracker:
 
         norms = np.linalg.norm(features, axis=1, keepdims=True)
         norms = np.clip(norms, 1e-12, None)
-        return features / norms
+        out = features / norms
+        bad = ~np.isfinite(out).all(axis=1)
+        if bad.any():
+            out = out.copy()
+            out[bad] = 0.0
+        return out
 
     def _compute_embeddings(self, dets, frame):
         if callable(self.custom_reid_extractor):
@@ -116,15 +136,13 @@ class BotSortTracker:
 
         return np.array(out, dtype=np.float32)
 
-    def get_track_feature_map(self):
-        feature_map = {}
+    def _iter_active_track_objects(self):
         inner = getattr(self, "tracker", None)
         if inner is None:
-            return feature_map
-
+            return
         for attr in ("active_tracks", "tracked_stracks", "stracks", "tracks"):
             obj_list = getattr(inner, attr, None)
-            if obj_list is None:
+            if not obj_list:
                 continue
             for obj in obj_list:
                 tid = None
@@ -132,25 +150,38 @@ class BotSortTracker:
                     if hasattr(obj, id_attr):
                         tid = int(getattr(obj, id_attr))
                         break
-                if tid is None:
-                    continue
-                feat = None
-                for feat_attr in ("curr_feat", "smooth_feat", "feat", "features"):
-                    if not hasattr(obj, feat_attr):
-                        continue
-                    value = getattr(obj, feat_attr)
-                    if value is None:
-                        continue
-                    if isinstance(value, list) and len(value) > 0:
-                        value = value[-1]
-                    try:
-                        feat = np.asarray(value, dtype=np.float32).reshape(-1)
-                    except Exception:
-                        feat = None
-                    if feat is not None and feat.size > 0:
-                        break
-                if feat is not None:
-                    feature_map[tid] = feat
-            if feature_map:
-                break
+                if tid is not None:
+                    yield tid, obj
+            return
+
+    @staticmethod
+    def _extract_track_feature(obj):
+        for feat_attr in ("curr_feat", "smooth_feat", "feat", "features"):
+            if not hasattr(obj, feat_attr):
+                continue
+            value = getattr(obj, feat_attr)
+            if value is None:
+                continue
+            if isinstance(value, list) and len(value) > 0:
+                value = value[-1]
+            feat = _finite_feature_vector(value)
+            if feat is not None:
+                return feat
+        return None
+
+    def get_track_feature_map(self):
+        feature_map = {}
+        for tid, obj in self._iter_active_track_objects():
+            feat = self._extract_track_feature(obj)
+            if feat is None:
+                continue
+            feature_map[tid] = normalized_for_matching(feat, self.appearance_update)
+        return feature_map
+
+    def get_track_appearance_raw_map(self):
+        feature_map = {}
+        for tid, obj in self._iter_active_track_objects():
+            feat = self._extract_track_feature(obj)
+            if feat is not None:
+                feature_map[tid] = feat.copy()
         return feature_map

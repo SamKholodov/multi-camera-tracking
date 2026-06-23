@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+import numpy as np
+
 from core.io.calibration import world_distance
 from core.mot.appearance import cross_camera_appearance_distance
 from core.mot.association.kinematic import speed_cost_adjustment
@@ -75,10 +77,19 @@ class CrossCameraAssociationConfig:
 
         t_min = _optional_float(assoc.get("geometry_t_min_m"))
         t_distant = _optional_float(assoc.get("geometry_t_distant_m"))
-        if t_min is None:
-            t_min = 14.0
+        legacy_geom = _optional_float(multi_cfg.get("geometry_max_distance"))
         if t_distant is None:
-            t_distant = 38.0
+            if legacy_geom is not None:
+                t_distant = legacy_geom if legacy_geom > 0 else 0.0
+            else:
+                t_distant = 38.0
+        if t_min is None:
+            if t_distant > 0 and legacy_geom is not None and legacy_geom > 0:
+                t_min = round(legacy_geom * 0.37, 1)
+            elif t_distant > 0:
+                t_min = 14.0
+            else:
+                t_min = 14.0
 
         return cls(
             temporal=bool(gates.get("temporal", False)) or temporal_mode != "off",
@@ -451,6 +462,10 @@ def association_cost_for_match(
             return None
         cost += speed_add
         cost += trajectory_cost_adjustment(config, query_wpt, gmeta, frame_idx)
+        if not np.isfinite(cost):
+            return None
         return cost
 
+    if not np.isfinite(reid):
+        return None
     return float(reid)
