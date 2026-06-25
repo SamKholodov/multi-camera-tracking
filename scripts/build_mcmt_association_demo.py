@@ -40,7 +40,7 @@ from scripts.visualize_gta_mcmt import clip_box, stack_camera_views
 
 DEFAULT_RUNS = {
     "gta": _ROOT / "outputs/configs_gta/geo_ablation/geo_tight",
-    "cityflow": _ROOT / "outputs/configs_cityflow/temporal_ablation/temporal_penalty_N50",
+    "cityflow": _ROOT / "outputs/cityflow_ablation_yolo26m/temporal_N100",
 }
 
 GTA_CAMERAS = [0, 1, 2, 3]
@@ -137,6 +137,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--iou-thresh", type=float, default=0.5)
     ap.add_argument("--out-dir", type=Path, default=_ROOT / "outputs/demos/mcmt_association")
     ap.add_argument("--run-dir", type=Path, default=None, help="Override run dir (single dataset only)")
+    ap.add_argument(
+        "--cameras",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="CAM",
+        help="Restrict CityFlow demo to these cameras (e.g. 6 7)",
+    )
+    ap.add_argument(
+        "--example-name",
+        type=str,
+        default=None,
+        help="Output subdir name instead of example_NNN (e.g. cam67_pair)",
+    )
     ap.add_argument("--force", action="store_true")
     return ap.parse_args()
 
@@ -737,9 +751,11 @@ def cross_cam_gt_ids_on_cams(
     *,
     min_area: float,
     min_side_px: float,
+    require_all_cams: bool = False,
 ) -> list[tuple[int, list[tuple[int, list[float]]]]]:
-    """GT ids visible on >=2 of the given cameras at this frame."""
-    ranked: list[tuple[tuple[int, int], int, list[tuple[int, list[float]]]]] = []
+    """GT ids visible on >=2 of the given cameras (or all, if require_all_cams)."""
+    ranked: list[tuple[tuple[int, int, int], int, list[tuple[int, list[float]]]]] = []
+    min_views = len(correct_cams) if require_all_cams else 2
     for gt_id in benchmark_gt_ids:
         if gt_id in error_gt_ids:
             continue
@@ -747,11 +763,354 @@ def cross_cam_gt_ids_on_cams(
             frame, gt_id, gt_by_cam, sorted(correct_cams), min_area=min_area, min_side_px=min_side_px
         )
         views = [(cam, box) for cam, box in views if cam in correct_cams]
-        if len(views) < 2:
+        if len(views) < min_views:
             continue
-        ranked.append(((len(views), 0), gt_id, views))
+        if require_all_cams and {cam for cam, _ in views} != correct_cams:
+            continue
+        ranked.append(((len(views), 0, 0), gt_id, views))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [(gt_id, views) for _, gt_id, views in ranked]
+
+
+def demo_pair_error_groups(
+    classified: list[ClassifiedMatch],
+    demo_cams: set[int],
+    *,
+    min_area: float,
+    min_side_px: float,
+) -> list[tuple[int | None, list[ClassifiedMatch], str]]:
+    """Cross-camera errors visible on demo cameras (wrong merge or split identity)."""
+    groups: list[tuple[int | None, list[ClassifiedMatch], str]] = []
+    seen_keys: set[tuple[int, int]] = set()
+
+    for gid, group in error_global_clusters(
+        classified, min_area=min_area, min_side_px=min_side_px
+    ):
+        demo_err = [m for m in group if m.cam in demo_cams]
+        if not demo_err:
+            continue
+        key = tuple(sorted((m.cam, m.gt_id) for m in demo_err))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        groups.append((gid, demo_err, "wrong_merge"))
+
+    by_gt: dict[int, list[ClassifiedMatch]] = {}
+    for m in classified:
+        if m.status != "error":
+            continue
+        if not bbox_ok(m.area, m.min_side, min_area=min_area, min_side_px=min_side_px):
+            continue
+        by_gt.setdefault(m.gt_id, []).append(m)
+
+    for gt_id, group in by_gt.items():
+        if len({m.cam for m in group}) < 2:
+            continue
+        if len({m.global_id for m in group}) <= 1:
+            continue
+        demo_err = [m for m in group if m.cam in demo_cams]
+        if not demo_err:
+            continue
+        key = tuple(sorted((m.cam, m.gt_id) for m in demo_err))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        groups.append((demo_err[0].global_id, demo_err, "split_identity"))
+
+    groups.sort(
+        key=lambda item: (
+            len(item[1]),
+            sum(m.area for m in item[1]),
+        ),
+        reverse=True,
+    )
+    return groups
+
+
+def fill_cam_pair_correct(
+    shared_matches: list[ClassifiedMatch],
+    classified: list[ClassifiedMatch],
+    demo_cams: set[int],
+    error_gt_ids: set[int],
+    benchmark_gt_ids: set[int],
+    *,
+    target_per_cam: int,
+    min_area: float,
+    min_side_px: float,
+) -> list[ClassifiedMatch]:
+    selected = list(shared_matches)
+    used_keys = {(m.cam, m.local_id) for m in selected}
+
+    for cam in sorted(demo_cams):
+        count = sum(1 for m in selected if m.cam == cam and m.status == "correct")
+        pool = [
+            m
+            for m in classified
+            if m.status == "correct"
+            and m.cam == cam
+            and m.gt_id not in error_gt_ids
+            and m.gt_id in benchmark_gt_ids
+            and (m.cam, m.local_id) not in used_keys
+            and bbox_ok(m.area, m.min_side, min_area=min_area, min_side_px=min_side_px)
+        ]
+        pool.sort(key=lambda m: match_quality(m), reverse=True)
+        for m in pool:
+            if count >= target_per_cam:
+                break
+            selected.append(m)
+            used_keys.add((m.cam, m.local_id))
+            count += 1
+    return selected
+
+
+def shared_correct_gt_on_cams(
+    matches: list[ClassifiedMatch],
+    demo_cams: set[int],
+) -> list[int]:
+    """GT ids with a correct match on every demo camera sharing one global_id."""
+    per_gt: dict[int, dict[int, ClassifiedMatch]] = {}
+    for m in matches:
+        if m.status != "correct" or m.cam not in demo_cams:
+            continue
+        per_gt.setdefault(m.gt_id, {})[m.cam] = m
+    shared: list[int] = []
+    for gt_id, by_cam in per_gt.items():
+        if demo_cams - set(by_cam.keys()):
+            continue
+        if len({by_cam[c].global_id for c in demo_cams}) == 1:
+            shared.append(gt_id)
+    return sorted(shared)
+
+
+def score_cam_pair_layout(
+    correct: list[ClassifiedMatch],
+    error: list[ClassifiedMatch],
+    demo_cams: set[int],
+    *,
+    pred_only: bool,
+) -> float:
+    shared = shared_correct_gt_on_cams(correct, demo_cams)
+    n_shared = len(shared)
+    per_cam_green = {cam: sum(1 for m in correct if m.cam == cam and m.status == "correct") for cam in demo_cams}
+    min_green = min(per_cam_green.values()) if per_cam_green else 0
+    error_on_demo = sum(1 for m in error if m.cam in demo_cams)
+    iou_sum = sum(m.iou for m in correct if m.bbox_source == "pred")
+    quality = sum(match_quality(m) for m in correct) + sum(match_quality(m) for m in error)
+    score = n_shared * 1e7 + min_green * 5e5 + quality * 1e4 + iou_sum * 100
+    score += error_on_demo * 3e5
+    if pred_only:
+        score += 5e5
+    if n_shared >= 4:
+        score += 2e6
+    elif n_shared >= 3:
+        score += 1e6
+    return score
+
+
+def search_cam_pair_cityflow_layout(
+    frame: int,
+    error_group: list[ClassifiedMatch],
+    pred_by_gt: dict[int, list[ClassifiedMatch]],
+    gt_by_cam: dict[int, np.ndarray],
+    classified: list[ClassifiedMatch],
+    demo_cams: set[int],
+    benchmark_gt_ids: set[int],
+    error_gt_ids: set[int],
+    *,
+    min_area: float,
+    min_side_px: float,
+    min_shared_gt: int = 3,
+    max_shared_gt: int = 4,
+    target_per_cam: int = 3,
+    gt_shrink: float = CF_GT_SHRINK,
+) -> tuple[list[ClassifiedMatch], list[ClassifiedMatch], list[int], list[int], float, bool] | None:
+    error_on_demo = [m for m in error_group if m.cam in demo_cams]
+    if not error_on_demo:
+        return None
+
+    cross_gt = cross_cam_gt_ids_on_cams(
+        frame,
+        gt_by_cam,
+        demo_cams,
+        benchmark_gt_ids,
+        error_gt_ids,
+        min_area=min_area,
+        min_side_px=min_side_px,
+        require_all_cams=True,
+    )
+    cross_by_id = {gt_id: views for gt_id, views in cross_gt}
+    for gt_id in shared_correct_gt_on_cams(
+        [m for m in classified if m.status == "correct"],
+        demo_cams,
+    ):
+        if gt_id in error_gt_ids or gt_id in cross_by_id:
+            continue
+        views = gt_views_for_id(
+            frame, gt_id, gt_by_cam, sorted(demo_cams), min_area=min_area, min_side_px=min_side_px
+        )
+        views = [(cam, box) for cam, box in views if cam in demo_cams]
+        pred_on = [m for m in pred_by_gt.get(gt_id, []) if m.cam in demo_cams]
+        if len(pred_on) >= len(demo_cams):
+            for m in pred_on:
+                if not any(cam == m.cam for cam, _ in views):
+                    views.append((m.cam, list(m.bbox_xyxy)))
+        if len(views) >= len(demo_cams):
+            cross_by_id[gt_id] = views
+    cross_gt = list(cross_by_id.items())
+    if not cross_gt:
+        return None
+
+    cross_gt.sort(
+        key=lambda item: (
+            sum(1 for m in pred_by_gt.get(item[0], []) if m.cam in demo_cams),
+            len(item[1]),
+        ),
+        reverse=True,
+    )
+    top = cross_gt[: max(max_shared_gt + 2, 8)]
+    best: tuple[list[ClassifiedMatch], list[ClassifiedMatch], list[int], list[int], float, bool] | None = None
+    best_score = -1.0
+    max_n = min(max_shared_gt, len(top))
+    min_n = min(min_shared_gt, max_n)
+    for n_gt in range(max_n, min_n - 1, -1):
+        if n_gt < 1:
+            continue
+        for gt_pick in combinations(top, n_gt):
+            picks: list[ClassifiedMatch] = []
+            gt_supplemented = False
+            ok = True
+            for gt_id, views in gt_pick:
+                views = [(cam, box) for cam, box in views if cam in demo_cams]
+                group, sup = build_cross_cam_matches_for_gt(
+                    frame,
+                    gt_id,
+                    views,
+                    classified,
+                    pred_by_gt,
+                    gt_shrink=gt_shrink,
+                )
+                group = [m for m in group if m.cam in demo_cams]
+                if len(group) < len(demo_cams):
+                    ok = False
+                    break
+                picks.extend(group)
+                gt_supplemented = gt_supplemented or sup
+            if not ok:
+                continue
+            picks = fill_cam_pair_correct(
+                picks,
+                classified,
+                demo_cams,
+                error_gt_ids,
+                benchmark_gt_ids,
+                target_per_cam=target_per_cam,
+                min_area=min_area,
+                min_side_px=min_side_px,
+            )
+            pred_only = not gt_supplemented
+            score = score_cam_pair_layout(
+                picks,
+                error_on_demo,
+                demo_cams,
+                pred_only=pred_only,
+            )
+            if score <= best_score:
+                continue
+            best_score = score
+            best = (
+                picks,
+                error_on_demo,
+                sorted(demo_cams),
+                sorted({m.cam for m in error_on_demo}),
+                score,
+                gt_supplemented,
+            )
+    return best
+
+
+def build_cam_pair_demo_matches(
+    frame: int,
+    classified: list[ClassifiedMatch],
+    gt_by_cam: dict[int, np.ndarray],
+    demo_cams: set[int],
+    pair_errors: list[tuple[int | None, list[ClassifiedMatch], str]],
+    benchmark_gt_ids: set[int],
+    *,
+    min_area: float,
+    min_side_px: float,
+    min_shared_gt: int,
+    max_shared_gt: int,
+    target_per_cam: int,
+) -> tuple[
+    list[ClassifiedMatch],
+    list[int],
+    list[int],
+    int | None,
+    list[int],
+    list[int],
+    bool,
+    float,
+    dict[str, float],
+    str,
+] | None:
+    best_result = None
+    best_score = -1.0
+    best_metrics: dict[str, float] = {}
+    best_error_kind = "wrong_merge"
+
+    for error_gid, error_group, error_kind in pair_errors:
+        error_gt_ids = {m.gt_id for m in error_group}
+        pred_by_gt = pred_correct_by_gt(
+            classified,
+            error_gt_ids,
+            benchmark_gt_ids,
+            min_area=min_area,
+            min_side_px=min_side_px,
+        )
+        for gt_id, matches in pred_by_gt.items():
+            pred_by_gt[gt_id] = [m for m in matches if m.cam in demo_cams]
+
+        for try_min in range(max_shared_gt, 0, -1):
+            if try_min < min_shared_gt and try_min != max(1, min_shared_gt - 1):
+                continue
+            layout = search_cam_pair_cityflow_layout(
+                frame,
+                error_group,
+                pred_by_gt,
+                gt_by_cam,
+                classified,
+                demo_cams,
+                benchmark_gt_ids,
+                error_gt_ids,
+                min_area=min_area,
+                min_side_px=min_side_px,
+                min_shared_gt=try_min,
+                max_shared_gt=max_shared_gt,
+                target_per_cam=target_per_cam,
+            )
+            if layout is None:
+                continue
+            correct, error_matches, correct_cams, error_cams, score, gt_supplemented = layout
+            total_score = score
+            if total_score <= best_score:
+                continue
+            best_score = total_score
+            best_metrics = {}
+            best_error_kind = error_kind
+            best_result = (
+                [*error_matches, *correct],
+                sorted({m.gt_id for m in correct}),
+                sorted({m.gt_id for m in error_matches}),
+                error_gid,
+                correct_cams,
+                error_cams,
+                gt_supplemented,
+                score,
+                best_metrics,
+                error_kind,
+            )
+            break
+    return best_result
 
 
 def build_cross_cam_matches_for_gt(
@@ -989,8 +1348,8 @@ def build_cityflow_demo_matches(
             error_gt_ids,
             min_area=min_area,
             min_side_px=min_side_px,
-            min_cross_cam_gt=min(2, n_correct),
-            max_cross_cam_gt=min(3, n_correct),
+            min_cross_cam_gt=2,
+            max_cross_cam_gt=n_correct,
         )
         if layout is None:
             continue
@@ -1066,6 +1425,7 @@ def build_frame_candidate(
     max_correct: int,
     min_error: int,
     allow_gt_supplement: bool = False,
+    demo_cams: set[int] | None = None,
 ) -> FrameCandidate | None:
     all_matches: list[TrackMatch] = []
     for cam in cameras:
@@ -1088,6 +1448,59 @@ def build_frame_candidate(
         return None
 
     classified = classify_cross_camera(all_matches)
+
+    if demo_cams is not None:
+        pair_errors = demo_pair_error_groups(
+            classified,
+            demo_cams,
+            min_area=min_area,
+            min_side_px=min_side_px,
+        )
+        if len(pair_errors) < min_error:
+            return None
+        cityflow = build_cam_pair_demo_matches(
+            frame,
+            classified,
+            gt_by_cam,
+            demo_cams,
+            pair_errors,
+            benchmark_gt_ids or set(),
+            min_area=min_area,
+            min_side_px=min_side_px,
+            min_shared_gt=min_correct,
+            max_shared_gt=max_correct,
+            target_per_cam=min_correct,
+        )
+        if cityflow is None:
+            return None
+        (
+            selected_matches,
+            selected_correct,
+            error_gt_ids,
+            selected_error_gid,
+            correct_cams,
+            error_cams,
+            gt_supplemented,
+            layout_score,
+            geo_metrics,
+            error_kind,
+        ) = cityflow
+        score = layout_score
+        return FrameCandidate(
+            frame=frame,
+            matches=selected_matches,
+            correct_gt_ids=selected_correct,
+            error_gt_ids=sorted(set(error_gt_ids)),
+            error_global_id=selected_error_gid,
+            score=score,
+            gt_supplemented=gt_supplemented,
+            correct_cams=sorted({m.cam for m in selected_matches if m.status == "correct"}),
+            error_cams=sorted({m.cam for m in selected_matches if m.status == "error"}),
+            error_cam=error_cams[0] if error_cams else None,
+            error_gt_pair_dist_m=geo_metrics.get("min_gt_pair_m"),
+            error_max_gt_pair_dist_m=geo_metrics.get("max_gt_pair_m"),
+            error_pred_gt_dist_m=geo_metrics.get("mean_pred_gt_m"),
+        )
 
     correct_by_gt: dict[int, list[ClassifiedMatch]] = {}
     for m in classified:
@@ -1119,6 +1532,8 @@ def build_frame_candidate(
     selected_error = {m.gt_id for m in selected_error_group}
 
     if allow_gt_supplement:
+        if demo_cams is not None:
+            raise RuntimeError("demo_cams path should have returned earlier")
         cityflow = build_cityflow_demo_matches(
             frame,
             classified,
@@ -1193,8 +1608,14 @@ def build_frame_candidate(
     )
 
 
-def select_diverse(candidates: list[FrameCandidate], num: int, min_gap: int) -> list[FrameCandidate]:
-    ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+def select_diverse(
+    candidates: list[FrameCandidate],
+    num: int,
+    min_gap: int,
+    *,
+    preserve_order: bool = False,
+) -> list[FrameCandidate]:
+    ranked = candidates if preserve_order else sorted(candidates, key=lambda c: c.score, reverse=True)
     selected: list[FrameCandidate] = []
     used_frames: list[int] = []
     for cand in ranked:
@@ -1205,6 +1626,54 @@ def select_diverse(candidates: list[FrameCandidate], num: int, min_gap: int) -> 
         if len(selected) >= num:
             break
     return selected
+
+
+def select_diverse_cam_pair(
+    candidates: list[FrameCandidate],
+    demo_cams: set[int],
+    *,
+    min_shared_gt: int = 3,
+) -> FrameCandidate | None:
+    """Pick the frame with the most shared correct GT ids on both demo cameras."""
+
+    def shared_count(c: FrameCandidate) -> int:
+        return len(shared_correct_gt_on_cams(
+            [m for m in c.matches if m.status == "correct"],
+            demo_cams,
+        ))
+
+    def green_per_cam(c: FrameCandidate) -> tuple[int, int]:
+        greens = {
+            cam: sum(1 for m in c.matches if m.status == "correct" and m.cam == cam)
+            for cam in demo_cams
+        }
+        return (min(greens.values()), max(greens.values()))
+
+    pool = [c for c in candidates if shared_count(c) >= min_shared_gt]
+    target = min_shared_gt
+    while not pool and target > 1:
+        target -= 1
+        pool = [c for c in candidates if shared_count(c) >= target]
+        if pool:
+            print(
+                f"[cityflow] No frame with >={min_shared_gt} shared GT on cams "
+                f"{sorted(demo_cams)}; using best with >={target}",
+                flush=True,
+            )
+            break
+    if not pool:
+        pool = candidates
+
+    pool.sort(
+        key=lambda c: (
+            shared_count(c),
+            green_per_cam(c),
+            sum(1 for m in c.matches if m.status == "error" and m.cam in demo_cams),
+            c.score,
+        ),
+        reverse=True,
+    )
+    return pool[0] if pool else None
 
 
 def select_diverse_cityflow(
@@ -1232,7 +1701,12 @@ def select_diverse_cityflow(
         pool = [c for c in candidates if cross_cam_vehicle_count(c) >= 1]
     if len(pool) < num:
         pool = candidates
-    return select_diverse(pool, num, min_gap)
+
+    def n_correct_boxes(c: FrameCandidate) -> int:
+        return sum(1 for m in c.matches if m.status == "correct")
+
+    pool = sorted(pool, key=lambda c: (n_correct_boxes(c), c.score), reverse=True)
+    return select_diverse(pool, num, min_gap, preserve_order=True)
 
 
 def build_demo_id_maps(
@@ -1446,9 +1920,15 @@ def export_example(
     dataset_name: str,
     cameras: list[int],
     load_frame_fn,
-) -> None:
-    ex_dir = out_dir / dataset_name / f"example_{example_idx:03d}"
+    example_name: str | None = None,
+    demo_cams: set[int] | None = None,
+    target_shared_gt: int | None = None,
+) -> Path:
+    subdir = example_name if example_name else f"example_{example_idx:03d}"
+    ex_dir = out_dir / dataset_name / subdir
     ex_dir.mkdir(parents=True, exist_ok=True)
+
+    export_cams = sorted(demo_cams) if demo_cams is not None else cameras
 
     by_cam: dict[int, list[ClassifiedMatch]] = {}
     for m in cand.matches:
@@ -1462,9 +1942,10 @@ def export_example(
         cam_order = demo_cam_order(cand.correct_cams, cand.error_cams)
     else:
         cam_order = sorted(by_cam.keys())
+    cam_order = [cam for cam in cam_order if cam in export_cams]
 
     for cam in cam_order:
-        if cam not in by_cam or cam not in cameras:
+        if cam not in by_cam or cam not in export_cams:
             continue
         img = load_frame_fn(cam, cand.frame)
         if img is None:
@@ -1538,6 +2019,49 @@ def export_example(
         },
         "cameras": cameras_meta,
     }
+    if demo_cams is not None:
+        shared = shared_correct_gt_on_cams(
+            [m for m in cand.matches if m.status == "correct"],
+            demo_cams,
+        )
+        green_per_cam = {
+            f"cam{cam}": sum(
+                1 for m in cand.matches if m.status == "correct" and m.cam == cam
+            )
+            for cam in sorted(demo_cams)
+        }
+        error_on_demo = [
+            m for m in cand.matches if m.status == "error" and m.cam in demo_cams
+        ]
+        meta["demo_cameras"] = sorted(demo_cams)
+        meta["shared_gt_ids"] = shared
+        meta["green_counts_per_cam"] = green_per_cam
+        meta["shared_gt_target_requested"] = target_shared_gt or 4
+        meta["shared_gt_achieved"] = len(shared)
+        if len(shared) < (target_shared_gt or 3):
+            meta["shared_gt_note"] = (
+                "CityFlow cam6+cam7 overlap allows at most "
+                f"{len(shared)} GT vehicle(s) visible on both cameras at one frame; "
+                "extra greens are correct single-camera tracks."
+            )
+        if error_on_demo:
+            err_gt = sorted({m.gt_id for m in error_on_demo})
+            err_gids = sorted({m.global_id for m in error_on_demo})
+            if len(err_gt) >= 2:
+                meta["error_description"] = (
+                    f"Wrong merge: global ID {cand.error_global_id} links different vehicles "
+                    f"GT {err_gt} on cam(s) {sorted({m.cam for m in error_on_demo})}"
+                )
+            else:
+                meta["error_description"] = (
+                    f"Split identity: GT {err_gt[0]} assigned global IDs {err_gids} "
+                    f"across cameras (shown on cam(s) {sorted({m.cam for m in error_on_demo})})"
+                )
+        else:
+            meta["error_description"] = (
+                f"Global ID {cand.error_global_id} wrongly merges GT ids "
+                f"{cand.error_gt_ids} (error not on demo cameras)"
+            )
     if cand.error_gt_pair_dist_m is not None:
         meta["error_geo"] = {
             "min_gt_pair_m": round(cand.error_gt_pair_dist_m, 3),
@@ -1557,6 +2081,7 @@ def export_example(
             1 for cams in per_gt.values() if len(cams) >= 2
         )
     (ex_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return ex_dir
 
 
 def scan_dataset(
@@ -1573,6 +2098,7 @@ def scan_dataset(
     num_examples: int,
     min_sync_gap: int,
     allow_gt_supplement: bool = False,
+    demo_cams: set[int] | None = None,
 ) -> list[FrameCandidate]:
     print(f"[{dataset_name}] Loading predictions from {run_dir}", flush=True)
 
@@ -1606,12 +2132,16 @@ def scan_dataset(
             max_correct=max_correct,
             min_error=min_error,
             allow_gt_supplement=allow_gt_supplement,
+            demo_cams=demo_cams,
         )
         if cand is not None:
             candidates.append(cand)
 
     print(f"[{dataset_name}] Found {len(candidates)} candidate frames", flush=True)
-    if dataset_name == "cityflow":
+    if demo_cams is not None:
+        picked = select_diverse_cam_pair(candidates, demo_cams, min_shared_gt=min_correct)
+        selected = [picked] if picked is not None else []
+    elif dataset_name == "cityflow":
         selected = select_diverse_cityflow(candidates, num_examples, min_sync_gap, min_cross_cam_gt=2)
     else:
         selected = select_diverse(candidates, num_examples, min_sync_gap)
@@ -1634,11 +2164,15 @@ def process_dataset(
     min_area = min_side * min_side
     min_correct = args.min_correct
     max_correct = args.max_correct
-    allow_gt_supplement = False
-    if dataset_name == "cityflow":
-        min_correct = 3
-        max_correct = 3
-        allow_gt_supplement = True
+    allow_gt_supplement = dataset_name == "cityflow"
+    demo_cams: set[int] | None = None
+    if args.cameras is not None:
+        if dataset_name != "cityflow":
+            raise SystemExit("--cameras is only supported for --dataset cityflow")
+        demo_cams = set(args.cameras)
+        unknown = demo_cams - set(S02_CAM_IDS)
+        if unknown:
+            raise SystemExit(f"Unknown CityFlow cameras: {sorted(unknown)}; valid: {S02_CAM_IDS}")
 
     selected = scan_dataset(
         dataset_name,
@@ -1653,6 +2187,7 @@ def process_dataset(
         num_examples=args.num_examples,
         min_sync_gap=min_gap,
         allow_gt_supplement=allow_gt_supplement,
+        demo_cams=demo_cams,
     )
 
     if not selected:
@@ -1667,22 +2202,32 @@ def process_dataset(
             return load_gta_frame(gta_dataset, cam, frame)
         return load_cityflow_frame(cam, frame)
 
+    export_cams = sorted(demo_cams) if demo_cams is not None else (
+        GTA_CAMERAS if dataset_name == "gta" else S02_CAM_IDS
+    )
+    example_name = args.example_name
+    if demo_cams is not None and example_name is None and args.num_examples == 1:
+        example_name = "example_001"
+
     index: list[dict] = []
     for idx, cand in enumerate(selected, start=1):
+        label = example_name if example_name and idx == 1 else f"example_{idx:03d}"
         print(
-            f"  example_{idx:03d}: frame={cand.frame} correct={cand.correct_gt_ids} error={cand.error_gt_ids}",
+            f"  {label}: frame={cand.frame} correct={cand.correct_gt_ids} error={cand.error_gt_ids}",
             flush=True,
         )
-        export_example(
+        ex_dir = export_example(
             cand,
             example_idx=idx,
             out_dir=out_dir,
             dataset_name=dataset_name,
-            cameras=GTA_CAMERAS if dataset_name == "gta" else S02_CAM_IDS,
+            cameras=export_cams,
             load_frame_fn=load_frame,
+            example_name=example_name if idx == 1 else None,
+            demo_cams=demo_cams,
+            target_shared_gt=min_correct,
         )
-        meta_path = out_dir / dataset_name / f"example_{idx:03d}" / "meta.json"
-        index.append(json.loads(meta_path.read_text(encoding="utf-8")))
+        index.append(json.loads((ex_dir / "meta.json").read_text(encoding="utf-8")))
 
     if dataset_name == "cityflow":
         release_cityflow_caps()
@@ -1692,6 +2237,10 @@ def process_dataset(
 
 def main() -> None:
     args = parse_args()
+    if args.cameras is not None and args.dataset not in ("cityflow", "both"):
+        raise SystemExit("--cameras requires --dataset cityflow")
+    if args.example_name is not None and args.num_examples > 1:
+        raise SystemExit("--example-name can only be used with --num-examples 1")
     out_dir = args.out_dir
     datasets = ["gta", "cityflow"] if args.dataset == "both" else [args.dataset]
     if args.force:

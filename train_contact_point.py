@@ -17,7 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train contact point regressor.")
     parser.add_argument(
         "--config",
-        default="config/contact_point/mobilenetv3_gta.yaml",
+        default="configs/train/contact_point/mobilenetv3_gta.yaml",
         help="Path to training YAML config.",
     )
     parser.add_argument("--device", default=None, help="Override train.device.")

@@ -23,7 +23,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train dual-head vehicle OSNet.")
     parser.add_argument(
         "--config",
-        default="config/reid_train/vehicle_osnet.yaml",
+        default="configs/train/reid/vehicle_osnet.yaml",
         help="Path to the training YAML config.",
     )
     parser.add_argument("--device", default=None, help="Override device from config.")

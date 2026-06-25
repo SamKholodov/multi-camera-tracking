@@ -52,6 +52,7 @@ datasets/cam_framenum/
 
 # Local datasets (download separately)
 gta_reid_fine_tune/
+datasets/cityflow_yolo_finetune/
 scripts/_tmp_gta_reid/
 scripts/_tmp_cityflow_reid/
 datasets/gta_mcmt/
@@ -88,10 +89,17 @@ test_bbox12/
 test_bbox12_check/
 frame.jpg
 
+# Local README demo builders (assets are committed under docs/assets/readme/)
+scripts/build_readme_mcmt_clip.py
+scripts/build_contact_point_geo_demo.py
+scripts/contact_point_cross_cam_stats.py
+docs/assets/readme/mcmt_gta_clip_meta.json
+
 # Local dev only (not part of public repo)
 tests/
 gta_demonstration/
 best_configs/*.local.yaml
+configs/best/**/*.local.yaml
 outputs/demo/
 
 # Vehicle ReID datasets (VeRi-776, VRIC — download separately)

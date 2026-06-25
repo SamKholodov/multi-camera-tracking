@@ -1,0 +1,68 @@
+# CityFlow S02 standalone zone tracklet run.
+
+run_mode: multi_camera
+detector:
+  model: models/yolo26l.pt
+  target_classes:
+  - 2
+  - 3
+  - 5
+  - 7
+  conf_thres: 0.2
+  imgsz: 640
+  device: 0
+tracker:
+  type: deepocsort
+  use_embeddings: true
+  reid_weights: models/osnet_ibn_x1_0_msmt17.pt
+  device: 0
+  half: false
+  det_thresh: 0.3
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+  appearance_update: aaf
+  reid_accum_conf_thresh: 0.6
+multi_camera:
+  cam_ids:
+  - 6
+  - 7
+  - 8
+  - 9
+  sources:
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c006/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c007/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c008/vdo_synch.avi
+  - datasets/AICity22_Track1_MTMC_Tracking/validation/S02/c009/vdo_synch.avi
+  homos: null
+  roi: auto
+  max_frames: null
+  results_dir: outputs/configs_cityflow/zone_tracklet
+  association:
+    gates:
+      temporal: false
+      cam_transition: false
+      zone_transition: true
+    reid_matching: true
+    geometry_distance_metric: plane
+    geometry_t_min_m: 14.0
+    geometry_t_distant_m: 0.0
+    geometry_mid_penalty: 0.15
+    same_cam_cost_add: 0.25
+    same_frame_linking: false
+    reid_strong_reject_threshold: 0.5
+    max_cross_cam_gap_frames: 100
+    reid_cost_threshold: 0.25
+    video_fps: 10.0
+    temporal_mode: 'off'
+    speed_limit_enabled: false
+    trajectory_enabled: false
+    global_delete_after_frames: 200
+    zones_path: zones/s02/full/zone_tracklet.yaml
+  max_history_gap_frames: 30
+output:
+  video_fps: 10.0
+  visualize: false
+  save_video: false
+  save_video_dir: outputs/configs_cityflow/zone_tracklet/videos
+  output_path: outputs/configs_cityflow/zone_tracklet/multicam.mp4
